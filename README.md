@@ -1,5 +1,12 @@
 # Pitboard
 
+This fork's production baseline is `release/0.15` (upstream `v0.15.2`), matching the installed
+Mac app and command line. Its default branch is `release/0.15`; upstream `main` is a
+1.0 beta with a newer account schema and is not an authorized production upgrade here.
+Local changes remain fixture-only until a reviewed release can be installed under the
+repository's safety rules. The owner's requested Codex/Pi auto-switch transaction is
+unfinished; removing warm-up settings alone does not enable it.
+
 Switch Claude Code, Codex and Claude Desktop between your own accounts without signing out,
 and see what each Claude Code and Codex account has left.
 
