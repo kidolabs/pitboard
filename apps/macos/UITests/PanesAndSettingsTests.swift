@@ -86,6 +86,37 @@ final class PanesAndSettingsTests: FixtureTestCase {
         XCTAssertTrue(standing.waitForNonExistence(timeout: 5))
     }
 
+    /// Codex/Pi is opt-in and changing it never changes Claude's controls.
+    @MainActor
+    func testCodexPiHasIndependentAutomaticSwitchControls() {
+        let app = launch(.twoTools)
+        app.openSettings()
+        app.toolbars.buttons["Limits"].click()
+        let claude = app.control("settings.autoSwitch")
+        let claudeShare = app.control("settings.autoSwitchAt")
+        let codex = app.control("settings.codexAutoSwitch")
+        let codexShare = app.control("settings.codexAutoSwitchAt")
+        XCTAssertTrue(codex.waitForExistence(timeout: 5))
+        XCTAssertTrue(codex.wait(for: \.isEnabled, toEqual: true, timeout: 5))
+        XCTAssertEqual(codex.value as? Int, 0)
+        XCTAssertEqual(claude.value as? Int, 0)
+        XCTAssertFalse(codexShare.isEnabled)
+        codex.click()
+        XCTAssertTrue(codex.wait(until: "value == 1", timeout: 5))
+        XCTAssertTrue(codexShare.wait(for: \.isEnabled, toEqual: true, timeout: 5))
+        codexShare.incrementArrows.firstMatch.click()
+        XCTAssertTrue(says(app, "Switch when a limit reaches 96%").waitForExistence(timeout: 5))
+        XCTAssertEqual(claude.value as? Int, 0)
+        XCTAssertFalse(claudeShare.isEnabled)
+        claude.click()
+        XCTAssertTrue(claude.wait(until: "value == 1", timeout: 5))
+        XCTAssertTrue(says(app, "Switch when a limit reaches 95%").exists)
+        codex.click()
+        XCTAssertTrue(codex.wait(until: "value == 0", timeout: 5))
+        XCTAssertEqual(claude.value as? Int, 1)
+        XCTAssertTrue(claudeShare.isEnabled)
+    }
+
     /// Kept warm-up accounts do not bring the removed section back into Limits.
     @MainActor
     func testLimitsHasNoWarmUpControls() {

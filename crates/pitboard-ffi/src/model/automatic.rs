@@ -10,7 +10,263 @@ use super::testing::{Hand, Machine, Refusal, any_read, offline_read, refusal, st
 use super::{Intent, RunOutNotice};
 use crate::present::testing::{LimitExt, account, window};
 use crate::{Account, Adoption, AutoLooked, AutoSwitched, Status};
+use pitboard_core::provider::ProviderId;
 use std::time::Duration;
+
+#[test]
+fn codex_controls_keep_claude_values_and_schedule_only_codex() {
+    let mut model = Hand::new();
+    assert!(
+        model
+            .send(Intent::SetCodexAutoSwitch { on: true, at: 80 })
+            .is_empty()
+    );
+    read_preferences(&mut model, true);
+    let mut machine = Machine::reading(Ok(status(vec![work(20.0), personal()])));
+    model.refresh(&mut machine);
+    let jobs = model.send(Intent::SetCodexAutoSwitch { on: true, at: 80 });
+    assert!(jobs.contains(&Job::AutoLook {
+        provider: ProviderId::Codex,
+        at: 80
+    }));
+    assert!(!jobs.iter().any(|job| matches!(
+        job,
+        Job::AutoLook {
+            provider: ProviderId::Claude,
+            ..
+        }
+    )));
+    let shown = model.shown().machine;
+    assert!(shown.auto_switch.on);
+    assert_eq!(shown.auto_switch.at, 95);
+    assert!(shown.codex_auto_switch.on);
+    assert_eq!(shown.codex_auto_switch.at, 80);
+    assert!(shown.codex_auto_switch.note.contains("next request"));
+    assert!(shown.codex_auto_switch.note.contains("restart"));
+    assert!(shown.codex_auto_switch.note.contains("DRAFT"));
+    model.run(&mut machine);
+    let (kept, _) = Preferences::kept(machine.preferences_file.as_deref(), None);
+    assert!(kept.auto_switch && kept.codex_auto_switch);
+    assert_eq!(kept.threshold_for(ProviderId::Codex).percent(), 80);
+    model.send(Intent::SetAutoSwitch { on: false, at: 90 });
+    let shown = model.shown().machine;
+    assert!(!shown.auto_switch.on);
+    assert!(shown.codex_auto_switch.on);
+    assert_eq!(shown.codex_auto_switch.at, 80);
+}
+
+#[test]
+fn legacy_preferences_never_schedule_codex_and_codex_uses_existing_lanes() {
+    let mut machine = Machine::reading(Ok(status(vec![work(20.0), personal()])));
+    let mut model = started_on(&mut machine);
+    assert!(!model.shown().machine.codex_auto_switch.on);
+    assert_eq!(model.shown().machine.codex_auto_switch.at, 95);
+    assert_eq!(
+        model.count(|job| matches!(
+            job,
+            Job::AutoLook {
+                provider: ProviderId::Codex,
+                ..
+            }
+        )),
+        0
+    );
+    model.send(Intent::SetCodexAutoSwitch { on: true, at: 85 });
+    assert_eq!(
+        Job::AutoLook {
+            provider: ProviderId::Codex,
+            at: 85
+        }
+        .lane(),
+        super::lanes::Lane::Reads
+    );
+    assert_eq!(
+        Job::AutoSwitch {
+            provider: ProviderId::Codex,
+            at: 85
+        }
+        .lane(),
+        super::lanes::Lane::Changes
+    );
+}
+
+fn codex_look(job: &Job) -> bool {
+    matches!(
+        job,
+        Job::AutoLook {
+            provider: ProviderId::Codex,
+            ..
+        }
+    )
+}
+
+fn claude_look(job: &Job) -> bool {
+    matches!(
+        job,
+        Job::AutoLook {
+            provider: ProviderId::Claude,
+            ..
+        }
+    )
+}
+
+fn codex_switch(job: &Job) -> bool {
+    matches!(
+        job,
+        Job::AutoSwitch {
+            provider: ProviderId::Codex,
+            ..
+        }
+    )
+}
+
+#[test]
+fn provider_refusals_standing_notifications_and_timers_are_independent() {
+    let mut machine = Machine::reading(Ok(status(vec![work(20.0), personal()])));
+    let mut model = started_on(&mut machine);
+    model.send(Intent::SetCodexAutoSwitch { on: true, at: 80 });
+    model.run(&mut machine);
+
+    // A failed Codex decision must not block Claude's decision or lose Claude's standing.
+    model.give(Answer::AutoLooked {
+        provider: ProviderId::Codex,
+        at: 80,
+        looked: Ok(AutoLooked::Act),
+    });
+    let decision = model.take(codex_switch);
+    assert_eq!(
+        decision,
+        Job::AutoSwitch {
+            provider: ProviderId::Codex,
+            at: 80
+        }
+    );
+    let failed = unwritable().error();
+    model.give(Answer::AutoSwitched {
+        provider: ProviderId::Codex,
+        done: Err(failed),
+    });
+    let codex_standing = model.shown().machine.codex_auto_switch.standing;
+    assert!(
+        codex_standing
+            .as_ref()
+            .is_some_and(|text| text.contains("Codex"))
+    );
+    model.give(Answer::AutoLooked {
+        provider: ProviderId::Claude,
+        at: 95,
+        looked: Ok(AutoLooked::Act),
+    });
+    assert_eq!(
+        model.take(auto_switch),
+        Job::AutoSwitch {
+            provider: ProviderId::Claude,
+            at: 95
+        }
+    );
+    model.give(Answer::AutoSwitched {
+        provider: ProviderId::Claude,
+        done: Err(unwritable().error()),
+    });
+    // The same code is independently notified, with different notification identities.
+    model.run(&mut machine);
+    let refusals: Vec<_> = machine
+        .posted
+        .iter()
+        .filter(|notice| notice.id.contains("auto-refused"))
+        .collect();
+    assert_eq!(refusals.len(), 2);
+    assert_ne!(refusals[0].id, refusals[1].id);
+    assert_eq!(
+        model.shown().machine.codex_auto_switch.standing,
+        codex_standing
+    );
+
+    // A successful look for Claude does not reset Codex's failure wait.
+    model.give(Answer::AutoLooked {
+        provider: ProviderId::Claude,
+        at: 95,
+        looked: Ok(AutoLooked::Stands(watching("work"))),
+    });
+    let jobs = model.give(Answer::AutoLooked {
+        provider: ProviderId::Codex,
+        at: 80,
+        looked: Ok(AutoLooked::Act),
+    });
+    assert!(!jobs.iter().any(auto_switch));
+    model.send(Intent::SetAutoSwitch { on: false, at: 95 });
+    model.run(&mut machine);
+    let claude_before = model.count(claude_look);
+    let codex_before = model.count(codex_look);
+    seconds(&mut model, &mut machine, 31, nothing);
+    assert_eq!(model.count(claude_look), claude_before);
+    assert!(model.count(codex_look) > codex_before);
+}
+
+#[test]
+fn codex_disabled_or_old_threshold_look_cannot_request_a_switch() {
+    let mut model = Hand::new();
+    read_preferences(&mut model, false);
+    let mut machine = Machine::reading(Ok(status(vec![work(20.0), personal()])));
+    model.refresh(&mut machine);
+    model.send(Intent::SetCodexAutoSwitch { on: true, at: 80 });
+    let old = model.take(codex_look);
+    model.send(Intent::SetCodexAutoSwitch { on: true, at: 90 });
+    machine.look = Ok(AutoLooked::Act);
+    let jobs = model.give(machine.answer(old));
+    assert!(!jobs.iter().any(auto_switch));
+    assert!(jobs.contains(&Job::AutoLook {
+        provider: ProviderId::Codex,
+        at: 90
+    }));
+    model.send(Intent::SetCodexAutoSwitch { on: false, at: 90 });
+    model.run(&mut machine);
+    assert_eq!(model.count(codex_switch), 0);
+    assert_eq!(model.shown().machine.codex_auto_switch.standing, None);
+}
+
+#[test]
+fn codex_switch_result_uses_codex_identity_and_restart_adoption() {
+    let mut model = Hand::new();
+    read_preferences(&mut model, false);
+    model.send(Intent::SetCodexAutoSwitch { on: true, at: 95 });
+    model.give(Answer::AutoLooked {
+        provider: ProviderId::Codex,
+        at: 95,
+        looked: Ok(AutoLooked::Act),
+    });
+    model.take(codex_switch);
+    assert_eq!(model.state.switch_under_way(), Some("codex/"));
+    model.give(Answer::AutoSwitched {
+        provider: ProviderId::Codex,
+        done: Ok(AutoSwitched::Switched {
+            from: "codex/main".into(),
+            to: "codex/spare".into(),
+            adoption: Adoption::Restart {
+                program: "codex".into(),
+            },
+            warnings: Vec::new(),
+            used: "96% of its 5-hour limit".into(),
+        }),
+    });
+    let shown = model.shown();
+    assert!(
+        shown
+            .machine
+            .codex_auto_switch
+            .standing
+            .as_ref()
+            .is_some_and(|text| text.contains("Switched Codex"))
+    );
+    assert_eq!(shown.machine.auto_switch.standing, None);
+    assert_eq!(shown.last_switches.len(), 1);
+    assert_eq!(shown.last_switches[0].provider, "codex");
+    assert_eq!(shown.last_switches[0].to, "codex/spare");
+    assert!(shown.last_switches[0].restart.is_some());
+    assert!(model.asked.iter().any(
+        |job| matches!(job, Job::Post { notice } if notice.title.starts_with("Switched Codex"))
+    ));
+}
 
 /// `work`, in use, its five-hour limit `percent` used.
 fn work(percent: f64) -> Account {
@@ -909,7 +1165,10 @@ fn turning_it_on_is_kept_and_looks_at_once() {
                     ..Preferences::default()
                 }
             },
-            Job::AutoLook { at: 90 },
+            Job::AutoLook {
+                provider: ProviderId::Claude,
+                at: 90
+            },
         ]
     );
     let shown = model.shown().machine.auto_switch;

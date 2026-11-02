@@ -496,6 +496,7 @@ pub(crate) fn run_out_notice(advice: &Advice) -> RunOutNotice {
 /// instead. It has nothing to switch to: the account left has reached the share it was
 /// switched away at.
 pub(crate) fn auto_switched_notice(
+    provider: ProviderId,
     from: &str,
     to: &str,
     used: &str,
@@ -504,8 +505,8 @@ pub(crate) fn auto_switched_notice(
 ) -> RunOutNotice {
     let follows = adoption.follows();
     RunOutNotice {
-        id: format!("auto/{from}/{to}/{at}"),
-        title: format!("Switched Claude Code to {to}"),
+        id: auto_notice_id(provider, format!("auto/{from}/{to}/{at}")),
+        title: format!("Switched {} to {to}", provider.name()),
         subtitle: None,
         body: format!("{from} had used {used}. {follows}"),
         switch_to: None,
@@ -514,10 +515,16 @@ pub(crate) fn auto_switched_notice(
 
 /// Where Pitboard would have switched Claude Code by itself and did not: how much of which
 /// limit, and why, in the core's words. Identified by what tells the reason apart, `key`.
-pub(crate) fn auto_skipped_notice(key: &str, from: &str, used: &str, why: &str) -> RunOutNotice {
+pub(crate) fn auto_skipped_notice(
+    provider: ProviderId,
+    key: &str,
+    from: &str,
+    used: &str,
+    why: &str,
+) -> RunOutNotice {
     RunOutNotice {
-        id: format!("auto-{key}"),
-        title: "Claude Code was not switched".into(),
+        id: auto_notice_id(provider, format!("auto-{key}")),
+        title: format!("{} was not switched", provider.name()),
         subtitle: None,
         body: format!("{from} has used {used}. {}.", capitalised(why)),
         switch_to: None,
@@ -526,10 +533,10 @@ pub(crate) fn auto_skipped_notice(key: &str, from: &str, used: &str, why: &str) 
 
 /// Where Pitboard cannot judge whether to switch Claude Code by itself: why, in the core's
 /// words. Identified by what tells the reason apart, `key`.
-pub(crate) fn auto_not_watching_notice(key: &str, why: &str) -> RunOutNotice {
+pub(crate) fn auto_not_watching_notice(provider: ProviderId, key: &str, why: &str) -> RunOutNotice {
     RunOutNotice {
-        id: format!("auto-{key}"),
-        title: "Pitboard is not switching Claude Code".into(),
+        id: auto_notice_id(provider, format!("auto-{key}")),
+        title: format!("Pitboard is not switching {}", provider.name()),
         subtitle: None,
         body: format!("{}.", capitalised(why)),
         switch_to: None,
@@ -550,13 +557,22 @@ pub(crate) fn standing_notice(warning: &Warning) -> RunOutNotice {
 }
 
 /// A switch Pitboard tried by itself and could not make, in the core's words.
-pub(crate) fn auto_refused_notice(code: &str, message: &str) -> RunOutNotice {
+pub(crate) fn auto_refused_notice(provider: ProviderId, code: &str, message: &str) -> RunOutNotice {
     RunOutNotice {
-        id: format!("auto-refused/{code}"),
-        title: "Pitboard could not switch Claude Code".into(),
+        id: auto_notice_id(provider, format!("auto-refused/{code}")),
+        title: format!("Pitboard could not switch {}", provider.name()),
         subtitle: None,
         body: message.into(),
         switch_to: None,
+    }
+}
+
+// Keep Claude notification identities stable, while separating Codex reasons/refusals.
+fn auto_notice_id(provider: ProviderId, id: String) -> String {
+    if provider == ProviderId::Claude {
+        id
+    } else {
+        format!("{}/{id}", provider.code())
     }
 }
 

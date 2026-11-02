@@ -246,7 +246,7 @@ pub(crate) struct Switched {
     pub(crate) warnings: Vec<Warning>,
 }
 
-/// What switching Claude Code by itself came to, as the model takes it. Times are epoch
+/// What switching a provider by itself came to, as the model takes it. Times are epoch
 /// seconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AutoSwitched {
@@ -486,7 +486,7 @@ fn adoption_of(adoption: provider::Adoption) -> Adoption {
     }
 }
 
-/// What switching Claude Code by itself at `threshold` came to, as the model takes it, with
+/// What switching a provider by itself at `threshold` came to, as the model takes it, with
 /// what a switch warned of.
 fn auto_switched(auto: Auto, warnings: Vec<Warning>, threshold: Threshold) -> AutoSwitched {
     match auto {
@@ -945,26 +945,39 @@ impl AppCore {
         })
     }
 
-    /// Switches Claude Code by itself where a limit of the account in use has reached `at`%
+    /// Switches `provider` by itself where a limit of the account in use has reached `at`%
     /// and another account has room, as the core decides under its lock. `at` is taken as the
     /// nearest share there can be.
-    pub(crate) fn auto_switch(&self, at: u8) -> Result<AutoSwitched, PitboardError> {
+    pub(crate) fn auto_switch(
+        &self,
+        provider: ProviderId,
+        at: u8,
+    ) -> Result<AutoSwitched, PitboardError> {
         let threshold = Threshold::clamped(i64::from(at));
-        changed(self.core().core.auto_switch(threshold), |auto, warnings| {
-            auto_switched(auto, warnings, threshold)
-        })
+        changed(
+            self.core().core.auto_switch_for(provider, threshold),
+            |auto, warnings| auto_switched(auto, warnings, threshold),
+        )
     }
 
-    /// What switching Claude Code by itself at `at`% would come to, from the core's files
+    /// What switching `provider` by itself at `at`% would come to, from the core's files
     /// alone: what stands, or that only a decision under its lock can say. Takes no lock,
     /// reads no keychain and asks nobody, so the model asks it after every read and every half
     /// a minute.
-    pub(crate) fn auto_look(&self, at: u8) -> Result<AutoLooked, PitboardError> {
+    pub(crate) fn auto_look(
+        &self,
+        provider: ProviderId,
+        at: u8,
+    ) -> Result<AutoLooked, PitboardError> {
         let threshold = Threshold::clamped(i64::from(at));
-        Ok(match self.readable()?.core.auto_look(threshold)? {
-            Look::Stands(auto) => AutoLooked::Stands(auto_switched(*auto, Vec::new(), threshold)),
-            Look::Act => AutoLooked::Act,
-        })
+        Ok(
+            match self.readable()?.core.auto_look_for(provider, threshold)? {
+                Look::Stands(auto) => {
+                    AutoLooked::Stands(auto_switched(*auto, Vec::new(), threshold))
+                }
+                Look::Act => AutoLooked::Act,
+            },
+        )
     }
 
     /// Each Claude Code account, whether Pitboard warms it up and where it stands, and the

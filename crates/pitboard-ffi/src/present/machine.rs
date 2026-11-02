@@ -14,6 +14,7 @@ use crate::model::state::AutoStanding;
 use crate::{AutoSwitched, FoundCommandLine, Level, Schedule};
 use pitboard_core::duty::autoswitch::Threshold;
 use pitboard_core::duty::warm::Halt;
+use pitboard_core::provider::ProviderId;
 
 /// What the app shows of this machine rather than its accounts. Not called `Machine`, the
 /// name the model's tests give the core they script.
@@ -31,6 +32,8 @@ pub struct MachineShown {
     pub command_line: CommandLineShown,
     /// Switching Claude Code by itself, as the settings show it.
     pub auto_switch: AutoSwitchShown,
+    /// Independent Codex/Pi controls; off by default, not inherited from Claude.
+    pub codex_auto_switch: AutoSwitchShown,
     /// Warming up accounts, as the settings show it.
     pub warm: WarmShown,
 }
@@ -73,15 +76,15 @@ pub struct WarmAccountShown {
     pub standing: Option<String>,
 }
 
-/// Switching Claude Code by itself before the account in use runs out, as the settings show
+/// Switching one provider by itself before the account in use runs out, as the settings show
 /// it: their switch, the share it switches at, what it came to last, and what is said under
 /// them.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct AutoSwitchShown {
     /// Whether the switch shows it as on. Off unless somebody turned it on.
     pub on: bool,
-    /// The share of a limit it switches at, a whole percentage, which `Intent::SetAutoSwitch`
-    /// takes back.
+    /// The share of a limit it switches at, a whole percentage, taken back by
+    /// `Intent::SetAutoSwitch` (Claude) or `Intent::SetCodexAutoSwitch` (Codex/Pi).
     pub at: u8,
     /// The lowest and highest shares there can be, for the control that picks one.
     pub lowest: u8,
@@ -248,7 +251,8 @@ pub(crate) fn machine(seen: &Seen) -> MachineShown {
         checks: checks(seen),
         activity: activity(seen),
         command_line: command_line(seen),
-        auto_switch: auto_switch(seen),
+        auto_switch: auto_switch(seen, ProviderId::Claude),
+        codex_auto_switch: auto_switch(seen, ProviderId::Codex),
         warm: warm(seen),
     }
 }
@@ -330,10 +334,14 @@ fn warm(seen: &Seen) -> WarmShown {
 
 // How soon running sessions follow is promised only while the last read found no file behind
 // the store.
-fn auto_switch(seen: &Seen) -> AutoSwitchShown {
+fn auto_switch(seen: &Seen, provider: ProviderId) -> AutoSwitchShown {
     let state = seen.state;
-    let at = state.preferences.threshold().percent();
-    let follows = if state
+    let at = state.preferences.threshold_for(provider).percent();
+    let follows = if provider == ProviderId::Codex {
+        "Once integrated, Pi adopts the switched identity on its next request; existing native Codex sessions \
+         need a restart. DRAFT: native Pi transaction safety integration is still required \
+         before deployment.".to_owned()
+    } else if state
         .warnings
         .iter()
         .any(|warning| warning.code == "fallback_login")
@@ -350,30 +358,33 @@ fn auto_switch(seen: &Seen) -> AutoSwitchShown {
         )
     };
     AutoSwitchShown {
-        on: state.preferences.auto_switch,
+        on: state.preferences.auto_on(provider),
         at,
         lowest: Threshold::LOWEST,
         highest: Threshold::HIGHEST,
         enabled: state.preferences_have_been_read(),
         at_label: format!("Switch when a limit reaches {at}%"),
         note: format!(
-            "Pitboard switches Claude Code to another of your accounts with room below \
+            "Pitboard switches {} to another of your accounts with room below \
              {at}% in every limit, once a limit of the one in use reaches {at}%, while the app \
-             is open. {follows} It never switches back by itself, and never switches Codex: a \
-             running codex keeps its account until restarted."
+             is open. {follows} It does not retry a failed prompt. If no account has room, \
+             it holds and explains why rather than looping.",
+            provider.name()
         ),
         standing: state
-            .auto_standing
+            .automatic(provider)
+            .standing
             .as_ref()
-            .filter(|_| state.preferences.auto_switch)
-            .map(|standing| auto_standing(seen, standing)),
+            .filter(|_| state.preferences.auto_on(provider))
+            .map(|standing| auto_standing(seen, provider, standing)),
     }
 }
 
-/// What switching Claude Code by itself came to last, as the line under the setting says it:
+/// What switching this provider by itself came to last, as the line under the setting says it:
 /// the core's words for the account watched and each reason, in sentences of the app's own,
 /// which `pitboard watch` frames apart, with clock times as the person's own clock says them.
-fn auto_standing(seen: &Seen, standing: &AutoStanding) -> String {
+fn auto_standing(seen: &Seen, provider: ProviderId, standing: &AutoStanding) -> String {
+    let tool = provider.name();
     match standing {
         AutoStanding::Came(AutoSwitched::Watching {
             account,
@@ -391,7 +402,7 @@ fn auto_standing(seen: &Seen, standing: &AutoStanding) -> String {
             seen.clock(*until)
         ),
         AutoStanding::Came(AutoSwitched::Switched { from, to, used, .. }) => {
-            format!("Switched Claude Code from {from} to {to}: {from} had used {used}.")
+            format!("Switched {tool} from {from} to {to}: {from} had used {used}.")
         }
         AutoStanding::Came(AutoSwitched::Skipped {
             from,
@@ -407,7 +418,7 @@ fn auto_standing(seen: &Seen, standing: &AutoStanding) -> String {
             }
         }
         AutoStanding::Came(AutoSwitched::NotWatching { why, until, .. }) => {
-            let said = format!("Pitboard is not switching Claude Code: {why}.");
+            let said = format!("Pitboard is not switching {tool}: {why}.");
             match until {
                 Some(until) => format!("{said} It asks again at {}.", seen.clock(*until)),
                 None => said,
@@ -417,13 +428,13 @@ fn auto_standing(seen: &Seen, standing: &AutoStanding) -> String {
             message,
             until: Some(until),
         } => format!(
-            "Pitboard could not switch Claude Code, and tries again at {}: {message}",
+            "Pitboard could not switch {tool}, and tries again at {}: {message}",
             seen.clock(*until)
         ),
         AutoStanding::Stopped {
             message,
             until: None,
-        } => format!("Pitboard cannot tell whether to switch Claude Code: {message}"),
+        } => format!("Pitboard cannot tell whether to switch {tool}: {message}"),
     }
 }
 

@@ -7,6 +7,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- The macOS Limits pane has separate Codex/Pi automatic-switch settings and a quota
+  threshold. The experimental backend keeps each provider's decisions and retries separate;
+  transactional Pi synchronization is still required before enabling it outside fixtures.
+
 ### Removed
 
 - On macOS, Limits no longer shows the warm-up schedule or account switches.

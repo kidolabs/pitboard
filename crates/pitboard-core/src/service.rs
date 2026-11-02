@@ -1131,21 +1131,34 @@ impl Pitboard {
     ///
     /// [`auto_look`]: Pitboard::auto_look
     pub fn auto_switch(&self, threshold: Threshold) -> Changing<Auto> {
+        self.auto_switch_for(ProviderId::Claude, threshold)
+    }
+
+    /// The native automatic-switch decision and transaction for an explicitly selected
+    /// provider. Claude defaults remain in [`Self::auto_switch`]. Codex requires fresh
+    /// five-hour and weekly coverage on both accounts and still reports restart-required:
+    /// running Codex processes do not hot-reload, and this does not synchronize Pi.
+    /// Providers without quota readings are not watched.
+    ///
+    /// The initial look is advisory only. Under state.lock, the outgoing identity and
+    /// quota are judged again and that same outgoing login is passed to the native switch.
+    pub fn auto_switch_for(&self, which: ProviderId, threshold: Threshold) -> Changing<Auto> {
         let permit = self.permitted()?;
-        let looked = self.auto_look(threshold).map_err(|error| Failed {
-            error,
-            warnings: Vec::new(),
-            said_first: 0,
-        })?;
+        let looked = self
+            .auto_look_for(which, threshold)
+            .map_err(|error| Failed {
+                error,
+                warnings: Vec::new(),
+                said_first: 0,
+            })?;
         if let Look::Stands(value) = looked {
             return Ok(Done {
                 value: *value,
                 warnings: Vec::new(),
             });
         }
-        let tool = ProviderId::Claude;
-        let (settled, mut warnings) = self.settled_for(permit, "auto-switch", "", Some(tool))?;
-        match switch::automatically(settled, threshold) {
+        let (settled, mut warnings) = self.settled_for(permit, "auto-switch", "", Some(which))?;
+        match switch::automatically(settled, which, threshold) {
             Ok((value, more)) => {
                 warnings.extend(more);
                 Ok(Done { value, warnings })
@@ -1162,8 +1175,16 @@ impl Pitboard {
     ///
     /// [`auto_switch`]: Pitboard::auto_switch
     pub fn auto_look(&self, threshold: Threshold) -> Result<Look> {
+        self.auto_look_for(ProviderId::Claude, threshold)
+    }
+
+    /// Read-only, nonblocking advice for [`Self::auto_switch_for`]. No keychain or network
+    /// access; `Look::Act` means redecide under the native state lock, not switch unconditionally.
+    pub fn auto_look_for(&self, which: ProviderId, threshold: Threshold) -> Result<Look> {
         let state = state::load(&self.ctx)?;
-        Ok(crate::duty::autoswitch::look(&self.ctx, &state, threshold))
+        Ok(crate::duty::autoswitch::look_for(
+            &self.ctx, &state, which, threshold,
+        ))
     }
 
     /// Which account somebody meant, as the key the engine looks accounts up by.
@@ -3799,7 +3820,7 @@ mod tests {
 
     /// Every change a front end can ask for, by its name. `enroll_signed_in` is asked apart,
     /// since it takes a sign-in made before.
-    const CHANGES: [(&str, Change); 16] = [
+    const CHANGES: [(&str, Change); 18] = [
         ("switch_to", |p, m| {
             p.switch_to(&m.key("there").typed()).err()
         }),
@@ -3827,6 +3848,14 @@ mod tests {
         ("uninstall", |p, _| p.uninstall().err()),
         ("auto_switch", |p, _| {
             p.auto_switch(Threshold::DEFAULT).err()
+        }),
+        ("auto_switch_for_claude", |p, _| {
+            p.auto_switch_for(ProviderId::Claude, Threshold::DEFAULT)
+                .err()
+        }),
+        ("auto_switch_for_codex", |p, _| {
+            p.auto_switch_for(ProviderId::Codex, Threshold::DEFAULT)
+                .err()
         }),
     ];
 

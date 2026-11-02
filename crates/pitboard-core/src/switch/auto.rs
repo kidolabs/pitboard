@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::provider::{self, ProviderId};
 use crate::service::Warning;
 
-/// Switches Claude Code where a limit of the account in use has reached `threshold` and
+/// Switches the selected tool where a limit of the account in use has reached `threshold` and
 /// another account has room, as [`crate::duty::autoswitch`] says, and records what it came to.
 ///
 /// Whose login Claude Code has stored is told first. Where it cannot be, nothing is judged
@@ -34,6 +34,7 @@ use crate::service::Warning;
 /// `auto-switch`, with the account it went to, or none before there was one.
 pub(crate) fn automatically(
     settled: Settled,
+    which: ProviderId,
     threshold: Threshold,
 ) -> Result<(Auto, Vec<Warning>)> {
     let Settled {
@@ -44,14 +45,22 @@ pub(crate) fn automatically(
     } = settled;
     let ctx = &ctx;
     let now = ctx.now();
-    let which = ProviderId::Claude;
-    let tool = provider::claude_code();
+    let provider::LoginKind::Document(tool) = provider::of(which) else {
+        return Ok((
+            Auto::NotWatching {
+                why: Blind::NoReading {
+                    account: which.code().into(),
+                },
+            },
+            Vec::new(),
+        ));
+    };
     let stopped = |subject: &str, error: Error| {
         audit::record(ctx, permit, "auto-switch", subject, error.code());
         error
     };
     let unchosen = "";
-    let mut ledger = Ledger::load(ctx);
+    let mut ledger = Ledger::load_for(ctx, which);
     let known_at = state.in_use(which).map(|last| last.known_at);
     if let Some(why) = ledger.unidentified(known_at, now) {
         return Ok((Auto::NotWatching { why }, Vec::new()));
@@ -62,7 +71,7 @@ pub(crate) fn automatically(
         Err(error) => {
             let why = ledger.not_told(identify::untold(&error), known_at, now);
             ledger
-                .save(ctx, permit)
+                .save_for(ctx, permit, which)
                 .map_err(|error| stopped(unchosen, error))?;
             let last = state
                 .account_in_use(which)
@@ -76,7 +85,7 @@ pub(crate) fn automatically(
         .map_err(|error| stopped(unchosen, error))?;
     if ledger.told() {
         ledger
-            .save(ctx, permit)
+            .save_for(ctx, permit, which)
             .map_err(|error| stopped(unchosen, error))?;
     }
     let identify::Live::Login(outgoing) = live else {
@@ -89,7 +98,7 @@ pub(crate) fn automatically(
     };
     // Said where nothing is switched; a switch says it with its own.
     let lost: Vec<Warning> = outgoing.lock_warning(which).into_iter().collect();
-    let judged = match autoswitch::watched(&state, Some(&outgoing.owner)) {
+    let judged = match autoswitch::watched(&state, which, Some(&outgoing.owner)) {
         Ok(account) => autoswitch::judge(ctx, &state, account, &ledger, threshold, now),
         Err(why) => return Ok((Auto::NotWatching { why }, lost)),
     };
@@ -98,7 +107,7 @@ pub(crate) fn automatically(
         Judged::Hold(hold) => {
             if ledger.say(&hold, now) {
                 ledger
-                    .save(ctx, permit)
+                    .save_for(ctx, permit, which)
                     .map_err(|error| stopped(unchosen, error))?;
                 audit::record(
                     ctx,
@@ -120,8 +129,11 @@ pub(crate) fn automatically(
     let decided_from = state.clone();
     ledger.attempt(&plan, now);
     ledger
-        .save(ctx, permit)
+        .save_for(ctx, permit, which)
         .map_err(|error| stopped(&to, error))?;
+    // `_exclusive` (state.lock) is still held. Move exactly the outgoing login identified
+    // above, never a fresh unguarded read after the quota judgment. Native tool locks,
+    // parking, recovery and restart-required adoption remain switch_from's responsibility.
     match switch_from(state, ctx, permit, tool, &plan.to, outgoing) {
         Ok((
             Switched {
@@ -133,7 +145,7 @@ pub(crate) fn automatically(
             // The switch was made. A record of it that could not be written costs at most
             // one more attempt at a limit of the account it left, should that account be
             // put back in use before it resets.
-            let _ = ledger.save(ctx, permit);
+            let _ = ledger.save_for(ctx, permit, which);
             audit::record(ctx, permit, "auto-switch", &to, "ok");
             Ok((
                 Auto::Switched {
@@ -161,7 +173,7 @@ pub(crate) fn automatically(
             };
             // A record that could not be written costs at most one more attempt at a limit of
             // this account, or one more decision saying why none is made.
-            if ledger.save(ctx, permit).is_ok()
+            if ledger.save_for(ctx, permit, which).is_ok()
                 && let Some(hold) = spent
             {
                 audit::record(
@@ -321,6 +333,264 @@ mod tests {
             .filter(|entry| entry.verb == "auto-switch")
             .map(|entry| (entry.verb, entry.subject, entry.outcome))
             .collect()
+    }
+
+    fn codex_nearly_out(name: &str) -> Machine {
+        let m = harness::codex_machine(name);
+        measured(&m, &harness::codex_id("here"), 96.0, 20.0);
+        measured(&m, &harness::codex_id("there"), 10.0, 30.0);
+        m
+    }
+
+    fn codex_auto(m: &Machine) -> crate::service::Changing<Auto> {
+        Pitboard::new(m.ctx.clone()).auto_switch_for(ProviderId::Codex, Threshold::DEFAULT)
+    }
+
+    #[test]
+    fn codex_is_explicit_and_keeps_native_restart_and_park_semantics() {
+        let m = codex_nearly_out("auto-codex-explicit");
+        let p = Pitboard::new(m.ctx.clone());
+        let before = m.live();
+        assert!(matches!(
+            p.auto_switch(Threshold::DEFAULT)
+                .expect("Claude default")
+                .value,
+            Auto::NotWatching {
+                why: Blind::NothingSignedIn
+            }
+        ));
+        assert_eq!(m.live(), before, "the old API never switches Codex");
+        assert!(matches!(
+            p.auto_look_for(ProviderId::Codex, Threshold::DEFAULT)
+                .expect("look"),
+            Look::Act
+        ));
+        // Claude-only settings must not disable Codex's actual provider transaction.
+        let config = m.ctx_home().join(".claude");
+        std::fs::create_dir_all(&config).expect("scratch config");
+        std::fs::write(
+            config.join("settings.json"),
+            serde_json::json!({
+                "env": {"CLAUDE_CODE_CUSTOM_OAUTH_URL": "https://oauth.example"},
+                "apiKeyHelper": "fixture-helper"
+            })
+            .to_string(),
+        )
+        .expect("scratch settings");
+        m.mem.runs("codex", 2);
+        let done = codex_auto(&m).expect("Codex switches");
+        assert!(matches!(done.value, Auto::Switched {
+            ref from, ref to, adoption: provider::Adoption::RestartRequired { program: "codex", .. }, ..
+        } if from == "codex/here" && to == "codex/there"));
+        assert!(
+            done.warnings
+                .iter()
+                .any(|warning| warning.code() == "sessions_still_running")
+        );
+        assert_eq!(
+            m.live().unwrap()["tokens"]["refresh_token"],
+            "there-refresh"
+        );
+        let state = state::load(&m.ctx).expect("state");
+        assert!(state.get(&m.key("there")).unwrap().parked.is_none());
+        assert!(state.get(&m.key("here")).unwrap().parked.is_some());
+        hold(&m, "after automatic Codex switch");
+    }
+
+    #[test]
+    fn codex_redecides_identity_and_quota_under_the_same_state_lock() {
+        let m = codex_nearly_out("auto-codex-redecision");
+        let p = Pitboard::new(m.ctx.clone());
+        assert!(matches!(
+            p.auto_look_for(ProviderId::Codex, Threshold::DEFAULT)
+                .unwrap(),
+            Look::Act
+        ));
+        // A manual switch wins after the advisory look. The locked path must not replay it.
+        p.switch_to("codex/there").expect("manual switch");
+        let settled = settle(&m.ctx, Permit::for_a_test(), Some(ProviderId::Codex))
+            .unwrap()
+            .0;
+        assert!(
+            matches!(automatically(settled, ProviderId::Codex, Threshold::DEFAULT).unwrap().0,
+            Auto::Watching { ref account, .. } if account == "codex/there")
+        );
+        assert!(logged(&m).is_empty());
+        hold(&m, "after stale Codex identity decision");
+
+        let m = codex_nearly_out("auto-codex-quota-redecision");
+        let p = Pitboard::new(m.ctx.clone());
+        assert!(matches!(
+            p.auto_look_for(ProviderId::Codex, Threshold::DEFAULT)
+                .unwrap(),
+            Look::Act
+        ));
+        measured(&m, &harness::codex_id("there"), 100.0, 100.0);
+        let before = m.live();
+        let settled = settle(&m.ctx, Permit::for_a_test(), Some(ProviderId::Codex))
+            .unwrap()
+            .0;
+        assert!(matches!(
+            automatically(settled, ProviderId::Codex, Threshold::DEFAULT)
+                .unwrap()
+                .0,
+            Auto::Skipped {
+                why: Skip::NoRoom { .. },
+                ..
+            }
+        ));
+        assert_eq!(m.live(), before);
+        assert!(logged(&m).is_empty());
+    }
+
+    #[test]
+    fn codex_no_room_or_unknown_never_moves_auth_or_retries_in_a_loop() {
+        for (name, windows) in [
+            (
+                "full",
+                vec![window("session", 100.0), window("weekly_all", 100.0)],
+            ),
+            ("partial", vec![window("session", 0.0)]),
+            ("unknown", Vec::new()),
+        ] {
+            let m = codex_nearly_out(&format!("auto-codex-no-room-{name}"));
+            crate::usage::readings::answered(
+                &m.ctx,
+                Permit::for_a_test(),
+                &[(
+                    harness::codex_id("there"),
+                    Snapshot {
+                        windows,
+                        ..answer(&m, 0.0, 0.0)
+                    },
+                )],
+            );
+            let before = (m.live(), state_file(&m), m.mem.vault().services());
+            for _ in 0..3 {
+                assert!(matches!(
+                    codex_auto(&m).unwrap().value,
+                    Auto::Skipped {
+                        why: Skip::NoRoom { .. },
+                        ..
+                    }
+                ));
+            }
+            assert_eq!((m.live(), state_file(&m), m.mem.vault().services()), before);
+            assert!(logged(&m).is_empty());
+            assert_eq!(stays(&m).len(), 1);
+            assert_eq!(m.api.calls(), 0, "no auth or quota probes to find room");
+        }
+    }
+
+    #[test]
+    fn codex_refusal_waits_then_passes_over_the_candidate() {
+        let mut m = codex_nearly_out("auto-codex-refused");
+        let clock = Arc::new(FixedClock::at(NOW));
+        m.ctx = m.ctx.clone().with_clock(clock.clone());
+        m.api.token_trouble(
+            &harness::codex_access("there-refresh"),
+            Trouble::Unauthorized,
+        );
+        m.api
+            .codex_renew_trouble("there-refresh", Trouble::InvalidGrant);
+        let before = m.live();
+        assert_eq!(
+            codex_auto(&m).expect_err("refused").error.code(),
+            "parked_login_refused"
+        );
+        assert_eq!(m.live(), before);
+        assert!(matches!(
+            codex_auto(&m).unwrap().value,
+            Auto::Waiting { .. }
+        ));
+        clock.advance(RETRY_SECONDS);
+        for _ in 0..2 {
+            assert!(matches!(
+                codex_auto(&m).unwrap().value,
+                Auto::Skipped {
+                    why: Skip::NoRoom { .. },
+                    ..
+                }
+            ));
+        }
+        assert_eq!(logged(&m).len(), 1, "one attempt, never a retry loop");
+        hold(&m, "after refused automatic Codex switch");
+    }
+
+    #[test]
+    fn codex_renewal_during_automatic_switch_is_not_overwritten() {
+        let m = codex_nearly_out("auto-codex-renewal-race");
+        let renewed = harness::codex_login("here", "here-renewed");
+        let failed = fault::meanwhile(
+            "switch.park_recorded",
+            {
+                let (store, service) = m.live_store();
+                let renewed = renewed.to_string();
+                move || store.plant(&service, &renewed)
+            },
+            || codex_auto(&m),
+        )
+        .expect_err("the outgoing login changed");
+        assert_eq!(failed.error.code(), "signed_in_account_changed");
+        assert_eq!(m.live(), Some(renewed));
+        assert!(matches!(
+            codex_auto(&m).unwrap().value,
+            Auto::Waiting { .. }
+        ));
+        hold(&m, "after a Codex renewal during the automatic transaction");
+    }
+
+    #[test]
+    fn codex_two_contending_front_ends_make_one_switch() {
+        let m = codex_nearly_out("auto-codex-contending");
+        let p = Pitboard::new(m.ctx.clone());
+        assert!(matches!(
+            p.auto_look_for(ProviderId::Codex, Threshold::DEFAULT)
+                .unwrap(),
+            Look::Act
+        ));
+        let outcomes = std::thread::scope(|scope| {
+            let a = scope.spawn(|| codex_auto(&m).unwrap().value);
+            let b = scope.spawn(|| codex_auto(&m).unwrap().value);
+            [a.join().unwrap(), b.join().unwrap()]
+        });
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, Auto::Switched { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| watching(outcome) == Some("codex/there"))
+                .count(),
+            1
+        );
+        assert_eq!(logged(&m).len(), 1);
+        hold(&m, "after contending automatic Codex decisions");
+    }
+
+    #[test]
+    fn codex_interrupted_automatic_switch_is_left_to_native_recovery() {
+        let m = codex_nearly_out("auto-codex-interrupted");
+        let died = fault::killing("switch.park_recorded", || codex_auto(&m));
+        assert_eq!(died.unwrap_err(), "switch.park_recorded");
+        let journal = std::fs::read(home::dir(&m.ctx).join("journal.json")).unwrap();
+        assert!(matches!(
+            codex_auto(&m).unwrap().value,
+            Auto::NotWatching {
+                why: Blind::SwitchInterrupted
+            }
+        ));
+        assert_eq!(
+            std::fs::read(home::dir(&m.ctx).join("journal.json")).unwrap(),
+            journal
+        );
+        let _ =
+            settle(&m.ctx, Permit::for_a_test(), Some(ProviderId::Codex)).expect("native recovery");
+        hold(&m, "after native Codex recovery");
     }
 
     #[test]
@@ -687,7 +957,7 @@ mod tests {
                 .expect("settled")
                 .0;
             came_to.push(
-                automatically(settled, Threshold::DEFAULT)
+                automatically(settled, ProviderId::Claude, Threshold::DEFAULT)
                     .expect("no failure")
                     .0,
             );
