@@ -49,7 +49,6 @@ use crate::{
     FoundCommandLine, GaveUp, OwnCommandLine, PitboardError, Renewed, Schedule, Status, Switch,
     Switched, Tool, Usage, Warning,
 };
-use pitboard_core::duty::autoswitch::Threshold;
 use pitboard_core::duty::cadence::{DECIDE_EVERY_SECONDS, Refusals};
 use pitboard_core::duty::warm::Overview;
 use pitboard_core::label::SEPARATOR;
@@ -71,7 +70,7 @@ pub(crate) struct Cadence {
     /// How often it reads every account by itself. Usage is asked of each tool's service
     /// for every account, so it is asked sparingly.
     pub(crate) read_every: Duration,
-    /// How often, with switching Claude Code by itself on, it asks the core's look though
+    /// How often, for each provider with automatic switching on, it asks the core's look though
     /// nothing was written: an account put in use stops settling, and the wait after a
     /// failed attempt ends, with nobody writing anything. As often as `pitboard watch`
     /// decides.
@@ -172,14 +171,11 @@ pub(crate) enum Job {
     /// Put the account `qualified` names in place of a login in use its service refuses for
     /// good, as the person agreed to.
     Replace { qualified: String },
-    /// Ask the core's look whether to switch Claude Code by itself at `at`%, from its files
-    /// alone: what stands, or that only a decision under its lock can say. It claims nothing.
-    AutoLook { at: u8 },
-    /// Switch Claude Code by itself where a limit of the account in use has reached `at`%
-    /// and another account has room: asked once the look says only a decision under the
-    /// core's lock can say, which decides whether, and to which, from whose login Claude Code
-    /// has stored.
-    AutoSwitch { at: u8 },
+    /// Ask the provider-specific core look from files alone. It claims nothing.
+    AutoLook { provider: ProviderId, at: u8 },
+    /// Re-decide and switch under the core's native transaction lock, never an unconditional
+    /// use of an account picked by the model.
+    AutoSwitch { provider: ProviderId, at: u8 },
     /// Warm up the first account turned on that is due, as the core decides, on a lane of its
     /// own: the core looks at its files first, and a warm-up runs Claude Code for seconds.
     WarmUp,
@@ -397,12 +393,15 @@ pub(crate) enum Answer {
         reopen: Option<String>,
         done: Result<Switched, PitboardError>,
     },
-    /// What the core's look at whether to switch Claude Code by itself came to.
+    /// What the provider-specific core look came to, tagged with the requested threshold.
     AutoLooked {
+        provider: ProviderId,
+        at: u8,
         looked: Result<AutoLooked, PitboardError>,
     },
-    /// What switching Claude Code by itself came to.
+    /// What the provider's automatic decision under the core lock came to.
     AutoSwitched {
+        provider: ProviderId,
         done: Result<AutoSwitched, PitboardError>,
     },
     /// What a warm-up came to: one by itself, or of the account `asked` names, somebody asked
@@ -610,7 +609,30 @@ impl Warming {
     }
 }
 
-/// What switching Claude Code by itself last came to, which the settings say under it.
+/// Per-provider state in the existing automatic-switch engine. Timers, refusal backoff,
+/// notification deduplication and standing never leak between Claude and Codex.
+#[derive(Debug)]
+pub(crate) struct Automatic {
+    decide: Timer,
+    pub(crate) standing: Option<AutoStanding>,
+    refusals: Refusals,
+    told: BTreeSet<String>,
+}
+
+impl Default for Automatic {
+    fn default() -> Self {
+        Self {
+            decide: Timer::Off,
+            standing: None,
+            refusals: Refusals::default(),
+            told: BTreeSet::new(),
+        }
+    }
+}
+
+const AUTO_PROVIDERS: [ProviderId; 2] = [ProviderId::Claude, ProviderId::Codex];
+
+/// What switching a provider by itself last came to, which the settings say under it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AutoStanding {
     /// What the core's look, or its decision under its lock, came to.
@@ -761,20 +783,6 @@ fn typed_as_core(provider: &str, name: &str) -> String {
     } else {
         format!("{provider}{SEPARATOR}{name}")
     }
-}
-
-/// A label as the core types it, taken apart: `codex/work` is Codex's `work`, and a bare
-/// `work` is Claude Code's, which is what a bare label has always meant.
-/// What `switching` holds while Claude Code is switched by itself, which names no account:
-/// the core chooses which.
-const AUTOMATICALLY: &str = "claude";
-
-/// An account's name with its tool, as `Account::qualified` gives it, from the name a switch
-/// said it by, which names its tool only where it is not Claude Code or another tool shares
-/// the name.
-fn qualified_claude(said: &str) -> String {
-    let (tool, label) = split(said);
-    format!("{tool}{SEPARATOR}{label}")
 }
 
 pub(crate) fn split(typed: &str) -> (&str, &str) {
@@ -954,9 +962,8 @@ pub(crate) struct State {
     readings_at: Option<i64>,
     look: Timer,
     timed_read: Timer,
-    /// The core's look at whether to switch Claude Code by itself, `decide_every` after the
-    /// last one ended, while switching by itself is on.
-    decide: Timer,
+    /// The existing automatic engine's independently scheduled provider state.
+    automatic: BTreeMap<ProviderId, Automatic>,
     /// Asking the core to warm up whichever account is due, `decide_every` after the last ask
     /// ended, while an account is turned on for it.
     warm_timer: Timer,
@@ -1032,11 +1039,6 @@ pub(crate) struct State {
     /// launch or an earlier one: kept in Pitboard's directory, so a run-out notified before
     /// a relaunch is not notified again after it.
     pub(crate) told: Told,
-    /// What switching Claude Code by itself has told about in a notification since the
-    /// model started, or since the last switch it made, by what it was: each reason it did
-    /// not switch away from a limit, for that limit and its reset, each reason it cannot judge
-    /// and each refusal, said once rather than at every look.
-    auto_told: BTreeSet<String>,
     /// The accounts whose login was replaced outside Pitboard that the last read said and a
     /// notification has told about, by `Account.id`.
     replaced_told: BTreeSet<String>,
@@ -1044,14 +1046,6 @@ pub(crate) struct State {
     /// account since Anthropic last named the login stored, which one read that asks has
     /// been started for.
     unconfirmed_asked: Option<String>,
-    /// What switching Claude Code by itself last came to, said under its setting while that
-    /// is on.
-    pub(crate) auto_standing: Option<AutoStanding>,
-    /// Switches by itself refused in a row, on the model's own clock, and the wait after
-    /// them: as long as the core waits after attempts that failed in a row, since a refusal
-    /// raised before the core could record it is a line in the activity log each time. Any
-    /// outcome, of a look or of a decision, ends the row.
-    auto_refusals: Refusals,
     /// The app's own preferences, kept in Pitboard's directory.
     pub(crate) preferences: Preferences,
     /// Whether the preferences have been read. Until they are, and for good where they
@@ -1092,7 +1086,10 @@ impl State {
             readings_at: None,
             look: Timer::Off,
             timed_read: Timer::Off,
-            decide: Timer::Off,
+            automatic: AUTO_PROVIDERS
+                .into_iter()
+                .map(|provider| (provider, Automatic::default()))
+                .collect(),
             switching: None,
             changing: 0,
             parking: Vec::new(),
@@ -1124,11 +1121,8 @@ impl State {
             tick: Timer::Off,
             advice: Vec::new(),
             told_this_launch: Told::new(),
-            auto_told: BTreeSet::new(),
             replaced_told: BTreeSet::new(),
             unconfirmed_asked: None,
-            auto_standing: None,
-            auto_refusals: Refusals::default(),
             warm_timer: Timer::Off,
             warm: Warming::default(),
             told: Told::new(),
@@ -1169,20 +1163,22 @@ impl State {
 
     /// When the next timer is due, since the model started, if any is set.
     pub(crate) fn next_due(&self) -> Option<Duration> {
-        [
-            self.look,
-            self.timed_read,
-            self.tick,
-            self.decide,
-            self.warm_timer,
-        ]
-        .into_iter()
-        .filter_map(|timer| match timer {
-            Timer::Due(at) => Some(at),
-            Timer::Off | Timer::Running => None,
-        })
-        .chain(self.windows.next_due())
-        .min()
+        [self.look, self.timed_read, self.tick, self.warm_timer]
+            .into_iter()
+            .filter_map(|timer| match timer {
+                Timer::Due(at) => Some(at),
+                Timer::Off | Timer::Running => None,
+            })
+            .chain(
+                self.automatic
+                    .values()
+                    .filter_map(|auto| match auto.decide {
+                        Timer::Due(at) => Some(at),
+                        _ => None,
+                    }),
+            )
+            .chain(self.windows.next_due())
+            .min()
     }
 
     /// Whether a sign-in is under way.
@@ -1355,7 +1351,12 @@ impl State {
                     });
                 }
             }
-            Intent::SetAutoSwitch { on, at } => self.auto_switch_set(on, at, jobs),
+            Intent::SetAutoSwitch { on, at } => {
+                self.auto_switch_set(ProviderId::Claude, on, at, jobs)
+            }
+            Intent::SetCodexAutoSwitch { on, at } => {
+                self.auto_switch_set(ProviderId::Codex, on, at, jobs)
+            }
             Intent::SetWarm { qualified, on } => jobs.push(Job::SetWarm { qualified, on }),
             Intent::SetWarmRange { from, to } => jobs.push(Job::SetWarmRange { from, to }),
             Intent::WarmNow { qualified } => {
@@ -1978,8 +1979,10 @@ impl State {
                 jobs,
             );
         }
-        if matches!(self.decide, Timer::Due(at) if at <= now.running) {
-            self.look_to_switch(jobs);
+        for provider in AUTO_PROVIDERS {
+            if matches!(self.automatic(provider).decide, Timer::Due(at) if at <= now.running) {
+                self.look_to_switch_for(provider, jobs);
+            }
         }
         if matches!(self.warm_timer, Timer::Due(at) if at <= now.running) {
             self.warm_tick(now, jobs);
@@ -2099,57 +2102,77 @@ impl State {
             .collect();
     }
 
-    /// The settings' switch for switching Claude Code by itself, with its share. Taken only
+    /// The settings' switch for switching one provider by itself, with its share. Taken only
     /// once the preferences have been read, so it is never kept over a file that could not
     /// be, and never lost under what the file says once it is. Turned on, or at another
     /// share, the core looks at once. Turned off, nothing is said under it, and a refusal's
     /// wait is over: turned on again, it is somebody asking.
-    fn auto_switch_set(&mut self, on: bool, at: u8, jobs: &mut Vec<Job>) {
-        if !self.preferences_read {
+    fn auto_switch_set(&mut self, provider: ProviderId, on: bool, at: u8, jobs: &mut Vec<Job>) {
+        if !self.preferences_read || !self.preferences.set_auto(provider, on, at) {
             return;
         }
-        let at = Some(i64::from(Threshold::clamped(i64::from(at)).percent()));
-        if self.preferences.auto_switch == on && self.preferences.auto_switch_at == at {
-            return;
-        }
-        self.preferences.auto_switch = on;
-        self.preferences.auto_switch_at = at;
         jobs.push(Job::KeepPreferences {
             preferences: self.preferences.clone(),
         });
         if !on {
-            self.auto_standing = None;
-            self.auto_refusals.ended();
+            let auto = self.automatic_mut(provider);
+            auto.standing = None;
+            auto.refusals.ended();
         }
-        self.look_to_switch(jobs);
+        self.look_to_switch_for(provider, jobs);
     }
 
-    /// Asks the core's look whether to switch Claude Code by itself, where somebody turned
+    pub(crate) fn automatic(&self, provider: ProviderId) -> &Automatic {
+        self.automatic.get(&provider).expect("automatic provider")
+    }
+
+    fn automatic_mut(&mut self, provider: ProviderId) -> &mut Automatic {
+        self.automatic
+            .get_mut(&provider)
+            .expect("automatic provider")
+    }
+
+    /// Asks the existing core look for each enabled provider, where somebody turned
     /// that on: after every read, after numbers or a change the poll found, as it is turned
     /// on, and every `decide_every`. The look reads files alone and claims nothing, so it is
     /// asked whatever else is under way.
     fn look_to_switch(&mut self, jobs: &mut Vec<Job>) {
-        if !self.preferences_read || !self.preferences.auto_switch {
-            self.decide = Timer::Off;
+        for provider in AUTO_PROVIDERS {
+            self.look_to_switch_for(provider, jobs);
+        }
+    }
+
+    fn look_to_switch_for(&mut self, provider: ProviderId, jobs: &mut Vec<Job>) {
+        if !self.preferences_read || !self.preferences.auto_on(provider) {
+            self.automatic_mut(provider).decide = Timer::Off;
             return;
         }
-        self.decide = Timer::Running;
+        self.automatic_mut(provider).decide = Timer::Running;
         jobs.push(Job::AutoLook {
-            at: self.preferences.threshold().percent(),
+            provider,
+            at: self.preferences.threshold_for(provider).percent(),
         });
     }
 
     /// The core's look is next due `decide_every` from now, or as a refusal's wait ends where
     /// that comes first, while switching by itself is on and the model runs by itself.
     fn decide_later(&mut self, now: Now) {
-        self.decide = if self.started && self.preferences.auto_switch {
+        for provider in AUTO_PROVIDERS {
+            self.decide_later_for(provider, now);
+        }
+    }
+
+    fn decide_later_for(&mut self, provider: ProviderId, now: Now) {
+        let decide = if self.started && self.preferences.auto_on(provider) {
             Timer::Due(
-                self.auto_refusals
+                self.automatic(provider)
+                    .refusals
                     .due(now.running, self.cadence.decide_every),
             )
         } else {
             Timer::Off
         };
+        self.automatic_mut(provider).decide = decide;
     }
 
     /// What the core's look came to, unless switching by itself was turned off meanwhile.
@@ -2157,19 +2180,25 @@ impl State {
     /// asked for. Files the core could not read decide nothing, which each read says too.
     fn auto_looked(
         &mut self,
+        provider: ProviderId,
+        at: u8,
         looked: Result<AutoLooked, PitboardError>,
         now: Now,
         jobs: &mut Vec<Job>,
     ) {
-        self.decide_later(now);
-        if !self.preferences.auto_switch {
+        self.decide_later_for(provider, now);
+        if !self.preferences.auto_on(provider) {
+            return;
+        }
+        if at != self.preferences.threshold_for(provider).percent() {
+            self.look_to_switch_for(provider, jobs);
             return;
         }
         match looked {
-            Ok(AutoLooked::Stands(outcome)) => self.auto_stands(outcome, jobs),
-            Ok(AutoLooked::Act) => self.auto_act(now, jobs),
+            Ok(AutoLooked::Stands(outcome)) => self.auto_stands(provider, outcome, jobs),
+            Ok(AutoLooked::Act) => self.auto_act(provider, now, jobs),
             Err(PitboardError::Failed { message, .. }) => {
-                self.auto_standing = Some(AutoStanding::Stopped {
+                self.automatic_mut(provider).standing = Some(AutoStanding::Stopped {
                     message,
                     until: None,
                 });
@@ -2183,16 +2212,19 @@ impl State {
     /// of this app's own is under way, behind which it would wait on the lane of changes
     /// holding every switch somebody asks for, nor while a refusal's wait runs: a later look
     /// asks again.
-    fn auto_act(&mut self, now: Now, jobs: &mut Vec<Job>) {
+    fn auto_act(&mut self, provider: ProviderId, now: Now, jobs: &mut Vec<Job>) {
         if self.switch_under_way().is_some()
             || self.changing > 0
-            || self.auto_refusals.waits(now.running)
+            || self.automatic(provider).refusals.waits(now.running)
         {
             return;
         }
-        self.switching = Some(AUTOMATICALLY.to_owned());
+        // No account has been chosen yet, but provider-specific bookkeeping (including
+        // a queued reopen) must still recognize which tool owns the native transaction.
+        self.switching = Some(format!("{}{SEPARATOR}", provider.code()));
         jobs.push(Job::AutoSwitch {
-            at: self.preferences.threshold().percent(),
+            provider,
+            at: self.preferences.threshold_for(provider).percent(),
         });
     }
 
@@ -2204,6 +2236,7 @@ impl State {
     /// next is asked for no sooner than the core waits after as many attempts failed in a row.
     fn auto_switched(
         &mut self,
+        provider: ProviderId,
         done: Result<AutoSwitched, PitboardError>,
         now: Now,
         jobs: &mut Vec<Job>,
@@ -2218,6 +2251,7 @@ impl State {
             }) => {
                 jobs.push(Job::Post {
                     notice: crate::present::auto_switched_notice(
+                        provider,
                         &from,
                         &to,
                         &used,
@@ -2225,42 +2259,50 @@ impl State {
                         now.epoch(),
                     ),
                 });
-                self.auto_told.clear();
-                self.auto_refusals.ended();
-                let qualified = qualified_claude(&to);
+                self.automatic_mut(provider).told.clear();
+                self.automatic_mut(provider).refusals.ended();
+                let label = to
+                    .split_once(SEPARATOR)
+                    .map_or(to.as_str(), |(_, label)| label);
+                let qualified = format!("{}{SEPARATOR}{label}", provider.code());
                 let switched = Switched {
                     outcome: Switch::Switched {
-                        provider: ProviderId::Claude.code().into(),
+                        provider: provider.code().into(),
                         from: from.clone(),
                         to: to.clone(),
                         adoption: adoption.clone(),
                     },
                     warnings: warnings.clone(),
                 };
-                self.auto_standing = Some(AutoStanding::Came(AutoSwitched::Switched {
-                    from,
-                    to,
-                    adoption,
-                    warnings,
-                    used,
-                }));
+                self.automatic_mut(provider).standing =
+                    Some(AutoStanding::Came(AutoSwitched::Switched {
+                        from,
+                        to,
+                        adoption,
+                        warnings,
+                        used,
+                    }));
                 self.switched(&qualified, None, Ok(switched), now, jobs);
             }
-            _ if !self.preferences.auto_switch => self.switching = None,
+            _ if !self.preferences.auto_on(provider) => self.switching = None,
             Ok(outcome) => {
                 self.switching = None;
-                self.auto_stands(outcome, jobs);
+                self.auto_stands(provider, outcome, jobs);
             }
             Err(PitboardError::Failed { code, message, .. }) => {
                 self.switching = None;
-                let wait = self.auto_refusals.refused(now.running);
-                self.auto_standing = Some(AutoStanding::Stopped {
+                let wait = self.automatic_mut(provider).refusals.refused(now.running);
+                self.automatic_mut(provider).standing = Some(AutoStanding::Stopped {
                     message: message.clone(),
                     until: Some(now.epoch() + wait),
                 });
-                if self.auto_told.insert(format!("refused/{code}")) {
+                if self
+                    .automatic_mut(provider)
+                    .told
+                    .insert(format!("refused/{code}"))
+                {
                     jobs.push(Job::Post {
-                        notice: crate::present::auto_refused_notice(&code, &message),
+                        notice: crate::present::auto_refused_notice(provider, &code, &message),
                     });
                 }
             }
@@ -2270,8 +2312,8 @@ impl State {
     /// The core's look or its decision came to `outcome`, which is no switch and ends a row of
     /// refusals. Said under the setting, and a reason it did not switch away from a limit, or
     /// cannot judge at all, posted once for what tells it apart until the next switch.
-    fn auto_stands(&mut self, outcome: AutoSwitched, jobs: &mut Vec<Job>) {
-        self.auto_refusals.ended();
+    fn auto_stands(&mut self, provider: ProviderId, outcome: AutoSwitched, jobs: &mut Vec<Job>) {
+        self.automatic_mut(provider).refusals.ended();
         let told = match &outcome {
             AutoSwitched::Skipped {
                 key,
@@ -2281,22 +2323,22 @@ impl State {
                 ..
             } => Some((
                 key.clone(),
-                crate::present::auto_skipped_notice(key, from, used, why),
+                crate::present::auto_skipped_notice(provider, key, from, used, why),
             )),
             AutoSwitched::NotWatching { key, why, .. } => Some((
                 key.clone(),
-                crate::present::auto_not_watching_notice(key, why),
+                crate::present::auto_not_watching_notice(provider, key, why),
             )),
             AutoSwitched::Watching { .. }
             | AutoSwitched::Waiting { .. }
             | AutoSwitched::Switched { .. } => None,
         };
         if let Some((key, notice)) = told
-            && self.auto_told.insert(key)
+            && self.automatic_mut(provider).told.insert(key)
         {
             jobs.push(Job::Post { notice });
         }
-        self.auto_standing = Some(AutoStanding::Came(outcome));
+        self.automatic_mut(provider).standing = Some(AutoStanding::Came(outcome));
     }
 
     /// What a read found of warming up: where it could not be read, what was known stands,
@@ -2528,8 +2570,14 @@ impl State {
                 reopen,
                 done,
             } => self.switched(&qualified, reopen, done.map_err(Some), now, jobs),
-            Answer::AutoLooked { looked } => self.auto_looked(looked, now, jobs),
-            Answer::AutoSwitched { done } => self.auto_switched(done, now, jobs),
+            Answer::AutoLooked {
+                provider,
+                at,
+                looked,
+            } => self.auto_looked(provider, at, looked, now, jobs),
+            Answer::AutoSwitched { provider, done } => {
+                self.auto_switched(provider, done, now, jobs)
+            }
             // The page says Pitboard opened the app only where it did.
             Answer::Opened {
                 tool,
@@ -2683,7 +2731,7 @@ impl State {
                     self.switched(&qualified, None, Err(None), now, jobs);
                 }
                 // Nothing is said of a look that came to nothing: the next is at its time.
-                Job::AutoLook { .. } => self.decide_later(now),
+                Job::AutoLook { provider, .. } => self.decide_later_for(provider, now),
                 // Whether it warmed anything up is not known; the next ask finds out.
                 Job::WarmUp | Job::WarmNow { .. } => {
                     self.warm.running = None;

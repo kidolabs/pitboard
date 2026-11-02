@@ -854,15 +854,18 @@ impl Machine {
                     done: self.switched.clone().map_err(|refused| refused.error()),
                 }
             }
-            Job::AutoLook { at } => {
+            Job::AutoLook { provider, at } => {
                 self.looked_at.push(at);
                 Answer::AutoLooked {
+                    provider,
+                    at,
                     looked: self.look.clone().map_err(|refused| refused.error()),
                 }
             }
-            Job::AutoSwitch { at } => {
+            Job::AutoSwitch { provider, at } => {
                 self.auto_at.push(at);
                 Answer::AutoSwitched {
+                    provider,
                     done: self.auto.clone().map_err(|refused| refused.error()),
                 }
             }

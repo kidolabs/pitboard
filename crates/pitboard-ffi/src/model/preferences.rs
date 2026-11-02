@@ -1,6 +1,7 @@
 //! The app's own preferences, which the model keeps in `app.json` in Pitboard's directory:
 //! the tools somebody said "Not Now" to a second account for, whether the app has ever shown
-//! anybody anything, and whether it switches Claude Code by itself, and at what share. The macOS app kept them in UserDefaults, and hands them over once,
+//! anybody anything, and independent Claude Code and Codex automatic-switch settings.
+//! The macOS app kept them in UserDefaults, and hands them over once,
 //! as `AppLaunch::earlier_preferences`: where the file is there, it wins.
 
 use super::EarlierPreferences;
@@ -31,6 +32,12 @@ pub(crate) struct Preferences {
     /// would write leaves the rest of the file readable, and is taken as the nearest share.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_switch_at: Option<i64>,
+    /// Codex/Pi is independently opt-in; older files leave it off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) codex_auto_switch: bool,
+    /// Codex's own quota threshold, defaulting to 95 rather than Claude's setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_auto_switch_at: Option<i64>,
 }
 
 impl Preferences {
@@ -68,6 +75,39 @@ impl Preferences {
     pub(crate) fn threshold(&self) -> Threshold {
         self.auto_switch_at
             .map_or_else(Threshold::default, Threshold::clamped)
+    }
+
+    pub(crate) fn threshold_for(&self, provider: ProviderId) -> Threshold {
+        if provider == ProviderId::Codex {
+            self.codex_auto_switch_at
+                .map_or_else(Threshold::default, Threshold::clamped)
+        } else {
+            self.threshold()
+        }
+    }
+
+    pub(crate) fn auto_on(&self, provider: ProviderId) -> bool {
+        match provider {
+            ProviderId::Claude => self.auto_switch,
+            ProviderId::Codex => self.codex_auto_switch,
+            _ => false,
+        }
+    }
+
+    /// Changes only the selected provider, keeping the original Claude JSON keys intact.
+    pub(crate) fn set_auto(&mut self, provider: ProviderId, on: bool, at: u8) -> bool {
+        let (enabled, threshold) = match provider {
+            ProviderId::Claude => (&mut self.auto_switch, &mut self.auto_switch_at),
+            ProviderId::Codex => (&mut self.codex_auto_switch, &mut self.codex_auto_switch_at),
+            _ => return false,
+        };
+        let at = Some(i64::from(Threshold::clamped(i64::from(at)).percent()));
+        if *enabled == on && *threshold == at {
+            return false;
+        }
+        *enabled = on;
+        *threshold = at;
+        true
     }
 
     /// `app.json`'s text for these preferences.
@@ -180,6 +220,38 @@ mod tests {
         let (odd, _) =
             Preferences::kept(Some(r#"{"auto_switch":true,"auto_switch_at":120}"#), None);
         assert_eq!(odd.threshold().percent(), 99);
+    }
+
+    #[test]
+    fn codex_preferences_migrate_without_changing_claude_and_round_trip_independently() {
+        let (old, from_file) =
+            Preferences::kept(Some(r#"{"auto_switch":true,"auto_switch_at":90}"#), None);
+        assert!(from_file);
+        assert!(old.auto_switch);
+        assert_eq!(old.threshold().percent(), 90);
+        assert!(!old.codex_auto_switch);
+        assert_eq!(old.threshold_for(ProviderId::Codex).percent(), 95);
+
+        let (new, _) = Preferences::kept(
+            Some(
+                r#"{"auto_switch":true,"auto_switch_at":90,"codex_auto_switch":true,"codex_auto_switch_at":80}"#,
+            ),
+            None,
+        );
+        assert!(new.codex_auto_switch);
+        assert_eq!(new.threshold().percent(), 90);
+        assert_eq!(new.threshold_for(ProviderId::Codex).percent(), 80);
+        assert_eq!(Preferences::kept(new.text().as_deref(), None), (new, true));
+        for (written, expected) in [(-1, 50), (120, 99)] {
+            let (kept, _) = Preferences::kept(
+                Some(&format!(
+                    r#"{{"auto_switch_at":90,"codex_auto_switch_at":{written}}}"#
+                )),
+                None,
+            );
+            assert_eq!(kept.threshold().percent(), 90);
+            assert_eq!(kept.threshold_for(ProviderId::Codex).percent(), expected);
+        }
     }
 
     /// A share no version would keep, written by hand or by a later version, is read as the

@@ -19,7 +19,7 @@ use crate::provider::{LoginKind, Provider, ProviderError, ProviderId};
 use crate::service::Permit;
 use crate::state::{Key, Park, State};
 use crate::switch::identify;
-use crate::usage::{Snapshot, Source};
+use crate::usage::Snapshot;
 use crate::usage::{budget, readings};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -552,7 +552,7 @@ pub(crate) fn ask_one(
         budget::record(ctx, permit, &[learned]);
     }
     let answer = answer.ok()?;
-    readings::answered(ctx, permit, &[(id.to_owned(), answer)]);
+    readings::answered_for(ctx, permit, &[(tool.id(), id.to_owned(), answer)]);
     readings::load(ctx).remove(id)
 }
 
@@ -930,16 +930,23 @@ pub(crate) fn report(ctx: &Context, permit: Permit, state: &State, answers: Answ
     let remembered = readings::load(ctx);
     let rows = assemble(state, &facts, |uuid| remembered.get(uuid).cloned(), now);
     crate::home::remove_retired(ctx, permit);
-    readings::answered(
+    // Persist raw answers, not assembled rows: the latter can include session updates or
+    // an ignored older answer. Neither may mint provenance for a legacy merged cache.
+    readings::answered_for(
         ctx,
         permit,
         &rows
             .iter()
-            .filter_map(|r| {
-                r.usage
-                    .as_ref()
-                    .filter(|u| u.source == Source::Live)
-                    .map(|u| (r.id.clone(), u.clone()))
+            .filter(|row| row.stale.is_none())
+            .filter_map(|row| {
+                let raw = if row.signed_in {
+                    facts.live_for(row.provider)?.usage.as_ref()?
+                } else {
+                    facts.parked.get(&row.id)?
+                };
+                raw.as_ref()
+                    .ok()
+                    .map(|answer| (row.provider, row.id.clone(), answer.clone()))
             })
             .collect::<Vec<_>>(),
     );
@@ -1010,9 +1017,14 @@ fn assemble(
     // The service's answer folded into what every front end has recorded, or what they
     // recorded where none came. So a row shows the one reading the status lines show, and an
     // answer that lags a session's latest response cannot take its share back.
-    let reading = |id: &str, asked: &Result<Snapshot, Stale>| match asked {
+    let reading = |which: ProviderId, id: &str, asked: &Result<Snapshot, Stale>| match asked {
         Ok(live) => (
-            Some(crate::usage::answered(recall(id).as_ref(), live, now)),
+            Some(crate::usage::answered_for(
+                which,
+                recall(id).as_ref(),
+                live,
+                now,
+            )),
             None,
         ),
         Err(stale) => (recall(id), Some(*stale)),
@@ -1037,12 +1049,12 @@ fn assemble(
                 let live = facts
                     .live_for(which)
                     .map_or(Err(Stale::NothingSignedIn), LiveLogin::usage);
-                reading(id, &live)
+                reading(which, id, &live)
             } else if replaced {
-                reading(id, &Err(Stale::LoginReplaced))
+                reading(which, id, &Err(Stale::LoginReplaced))
             } else {
                 let parked = facts.parked.get(id).cloned();
-                reading(id, &parked.unwrap_or(Err(Stale::NotAsked)))
+                reading(which, id, &parked.unwrap_or(Err(Stale::NotAsked)))
             };
             // 0.11.0 recorded Codex's as its token says it: `pro`.
             let plan = facts
@@ -1081,7 +1093,7 @@ fn assemble(
             if rows.iter().any(|r| r.provider == which && r.id == id) {
                 continue;
             }
-            let (usage, stale) = reading(&id, &live.usage());
+            let (usage, stale) = reading(which, &id, &live.usage());
             let plan = facts.plans.get(&id).cloned().flatten();
             rows.push(Row {
                 provider: which,
@@ -1149,7 +1161,7 @@ mod tests {
     use crate::state::Account;
     use crate::store::memory::Fault;
     use crate::time::{Clock, FixedClock};
-    use crate::usage::Window;
+    use crate::usage::{Source, Window};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1964,10 +1976,131 @@ mod tests {
         assert_eq!(rows[1].plan.as_deref(), Some("Plus"));
     }
 
-    /// OpenAI's answer does not list every limit, so a window it leaves out stands on a
-    /// Codex row while it runs, in its place.
     #[test]
-    fn a_codex_row_keeps_a_running_window_openai_left_out() {
+    fn report_does_not_refresh_codex_windows_omitted_from_the_raw_answer() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (ctx, _, _) = machine(scratch.path(), None);
+        let s = State {
+            accounts: vec![codex_account("work", "work-acc")],
+            ..State::default()
+        };
+        let mut old = reading(10.0, Source::Remembered);
+        old.windows[0].kind = "five_hour".into();
+        old.windows.push(Window {
+            kind: "seven_day".into(),
+            ..old.windows[0].clone()
+        });
+        old.lists_every_limit = false;
+        std::fs::write(
+            crate::home::dir(&ctx).join("usage.json"),
+            serde_json::to_vec(&HashMap::from([("work-acc", old.clone())])).unwrap(),
+        )
+        .unwrap();
+        let raw = Snapshot {
+            windows: vec![old.windows[1].clone()],
+            observed_at: Some(NOW),
+            answered_at: Some(NOW),
+            source: Source::Live,
+            ..old
+        };
+        let result = report(
+            &ctx,
+            Permit::for_a_test(),
+            &s,
+            Answers {
+                live: BTreeMap::from([(ProviderId::Codex, live("work-acc", Ok(raw)))]),
+                parked: BTreeMap::new(),
+                plans: BTreeMap::new(),
+                learned: Vec::new(),
+                found: Vec::new(),
+            },
+        );
+        let shown = result.rows[0].usage.as_ref().unwrap();
+        assert_eq!(
+            shown.windows.len(),
+            1,
+            "only a raw reported window is fresh"
+        );
+        assert_eq!(shown.windows[0].kind, "seven_day");
+        let saved = &readings::load(&ctx)["work-acc"];
+        assert_eq!(saved.windows, shown.windows);
+        assert_eq!(saved.answered_at, Some(NOW));
+        assert_eq!(readings::codex_raw(&ctx)["work-acc"], *saved);
+    }
+
+    #[test]
+    fn report_cannot_mint_provenance_from_an_ignored_codex_answer() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (ctx, _, _) = machine(scratch.path(), None);
+        let s = State {
+            accounts: vec![codex_account("work", "work-acc")],
+            ..State::default()
+        };
+        let mut legacy = reading(10.0, Source::Remembered);
+        legacy.answered_at = Some(NOW);
+        legacy.observed_at = Some(NOW);
+        let file = crate::home::dir(&ctx).join("usage.json");
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&HashMap::from([("work-acc", legacy)])).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(&file).unwrap();
+        let result = report(
+            &ctx,
+            Permit::for_a_test(),
+            &s,
+            Answers {
+                live: BTreeMap::new(),
+                parked: BTreeMap::from([("work-acc".into(), Ok(reading(20.0, Source::Live)))]),
+                plans: BTreeMap::new(),
+                learned: Vec::new(),
+                found: Vec::new(),
+            },
+        );
+        assert_eq!(
+            result.rows[0].usage.as_ref().unwrap().windows[0].percent,
+            10.0
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        assert!(readings::codex_raw(&ctx).is_empty());
+    }
+
+    #[test]
+    fn ask_one_uses_the_provider_not_the_window_shape() {
+        let scratch = tempfile::tempdir().unwrap();
+        let (ctx, _, api) = machine(scratch.path(), None);
+        let mut old = reading(10.0, Source::Remembered);
+        old.windows.push(Window {
+            kind: "weekly_all".into(),
+            ..old.windows[0].clone()
+        });
+        old.lists_every_limit = false;
+        readings::answered(&ctx, Permit::for_a_test(), &[("work-acc".into(), old)]);
+        // Deliberately use Claude's window names for Codex: only the passed provider
+        // controls the fold and can establish raw provenance.
+        let mut raw = reading(20.0, Source::Live);
+        raw.answered_at = Some(NOW);
+        raw.observed_at = Some(NOW);
+        raw.lists_every_limit = false;
+        api.using("access-work-acc", raw);
+        let saved = ask_one(
+            &ctx,
+            Permit::for_a_test(),
+            crate::provider::document(ProviderId::Codex),
+            "work-acc",
+            &serde_json::from_str(&codex_login("work-acc", "work-acc")).unwrap(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(saved.windows.len(), 1);
+        assert_eq!(saved.windows[0].kind, "session");
+        assert_eq!(readings::codex_raw(&ctx)["work-acc"], saved);
+    }
+
+    /// An omitted Codex window is unknown, even when an older reading still runs.
+    #[test]
+    fn a_codex_row_drops_a_running_window_openai_left_out() {
         let s = State {
             accounts: vec![codex_account("work", "work-acc")],
             ..State::default()
@@ -2010,7 +2143,7 @@ mod tests {
             .iter()
             .map(|w| (w.kind.as_str(), w.percent))
             .collect();
-        assert_eq!(shares, [("five_hour", 30.0), ("seven_day", 45.0)]);
+        assert_eq!(shares, [("seven_day", 45.0)]);
     }
 
     /// Grouped by tool in the order every listing uses, signed in first within each, and

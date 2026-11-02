@@ -6,7 +6,7 @@ struct LimitsSettings: View {
 
     var body: some View {
         let auto = model.machine.autoSwitch
-        let warm = model.machine.warm
+        let codex = model.machine.codexAutoSwitch
         Form {
             Section {
                 Toggle(
@@ -36,70 +36,35 @@ struct LimitsSettings: View {
             } footer: {
                 Text(auto.note).footnote()
             }
-
             Section {
-                DatePicker(
-                    "From",
-                    selection: timeOfDay(warm.from) {
-                        model.send(.setWarmRange(from: $0, to: warm.to))
-                    },
-                    displayedComponents: .hourAndMinute
+                Toggle(
+                    "Switch Codex/Pi automatically",
+                    isOn: Binding(
+                        get: { codex.on },
+                        set: { model.send(.setCodexAutoSwitch(on: $0, at: codex.at)) })
                 )
-                .accessibilityIdentifier("settings.warmFrom")
-                DatePicker(
-                    "To",
-                    selection: timeOfDay(warm.to) {
-                        model.send(.setWarmRange(from: warm.from, to: $0))
-                    },
-                    displayedComponents: .hourAndMinute
+                .accessibilityIdentifier("settings.codexAutoSwitch")
+                .disabled(!codex.enabled)
+                Stepper(
+                    codex.atLabel,
+                    value: Binding(
+                        get: { Int(codex.at) },
+                        set: { model.send(.setCodexAutoSwitch(on: codex.on, at: UInt8($0))) }),
+                    in: Int(codex.lowest)...Int(codex.highest)
                 )
-                .accessibilityIdentifier("settings.warmTo")
-                if warm.accounts.isEmpty {
-                    Text("No Claude Code account is enrolled yet.").explanatory()
-                }
-                ForEach(warm.accounts, id: \.qualified) { account in
-                    Toggle(
-                        isOn: Binding(
-                            get: { account.on },
-                            set: { model.send(.setWarm(qualified: account.qualified, on: $0)) })
-                    ) {
-                        Text(account.plan.map { "\(account.title) · \($0)" } ?? account.title)
-                        if let standing = account.standing {
-                            Text(standing)
-                        }
-                    }
-                    .accessibilityIdentifier("settings.warm.\(account.qualified)")
-                }
-                if let standing = warm.standing {
+                .accessibilityIdentifier("settings.codexAutoSwitchAt")
+                .disabled(!codex.enabled || !codex.on)
+                if let standing = codex.standing {
                     Text(standing)
                         .explanatory()
-                        .accessibilityIdentifier("settings.warmStanding")
+                        .accessibilityIdentifier("settings.codexAutoSwitchStanding")
                 }
             } header: {
-                Text("Warm up limits")
+                Text("Codex/Pi — independent quota threshold")
             } footer: {
-                Text(warm.note).footnote()
+                Text(codex.note).footnote()
             }
-            .disabled(!warm.enabled)
         }
         .formStyle(.grouped)
     }
-}
-
-@MainActor
-private func timeOfDay(
-    _ minutes: UInt16, set: @escaping @MainActor @Sendable (UInt16) -> Void
-) -> Binding<Date> {
-    Binding(
-        get: {
-            // 24:00, the end of a day, shows as midnight.
-            let minutes = Int(minutes) % (24 * 60)
-            return Calendar.current.date(
-                bySettingHour: minutes / 60, minute: minutes % 60, second: 0, of: .now) ?? .now
-        },
-        set: { date in
-            let parts = Calendar.current.dateComponents([.hour, .minute], from: date)
-            let picked = (parts.hour ?? 0) * 60 + (parts.minute ?? 0)
-            set(UInt16(picked))
-        })
 }

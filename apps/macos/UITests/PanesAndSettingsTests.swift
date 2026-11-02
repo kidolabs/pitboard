@@ -86,28 +86,50 @@ final class PanesAndSettingsTests: FixtureTestCase {
         XCTAssertTrue(standing.waitForNonExistence(timeout: 5))
     }
 
-    /// The fixture's personal is on for warm-ups with no five-hour period running, so it
-    /// warms up as the app starts.
+    /// Codex/Pi is opt-in and changing it never changes Claude's controls.
     @MainActor
-    func testWarmingUpAccounts() {
-        let app = launch(.warmUp)
-        app.openWindow()
-        let warmed = app.text("BEGINSWITH", "Warms up again at ")
-        XCTAssertTrue(warmed.waitForExistence(timeout: 30), "personal is warmed up")
-
+    func testCodexPiHasIndependentAutomaticSwitchControls() {
+        let app = launch(.twoTools)
         app.openSettings()
         app.toolbars.buttons["Limits"].click()
-        let personal = app.control("settings.warm.claude/personal")
-        let work = app.control("settings.warm.claude/work")
-        XCTAssertTrue(personal.waitForExistence(timeout: 5))
-        XCTAssertTrue(personal.wait(for: \.isEnabled, toEqual: true, timeout: 5))
-        XCTAssertEqual(personal.value as? Int, 1)
-        XCTAssertEqual(work.value as? Int, 0)
-        XCTAssertTrue(app.control("settings.warmFrom").exists)
-        XCTAssertTrue(app.control("settings.warmStanding").waitForExistence(timeout: 5))
+        let claude = app.control("settings.autoSwitch")
+        let claudeShare = app.control("settings.autoSwitchAt")
+        let codex = app.control("settings.codexAutoSwitch")
+        let codexShare = app.control("settings.codexAutoSwitchAt")
+        XCTAssertTrue(codex.waitForExistence(timeout: 5))
+        XCTAssertTrue(codex.wait(for: \.isEnabled, toEqual: true, timeout: 5))
+        XCTAssertEqual(codex.value as? Int, 0)
+        XCTAssertEqual(claude.value as? Int, 0)
+        XCTAssertFalse(codexShare.isEnabled)
+        codex.click()
+        XCTAssertTrue(codex.wait(until: "value == 1", timeout: 5))
+        XCTAssertTrue(codexShare.wait(for: \.isEnabled, toEqual: true, timeout: 5))
+        codexShare.incrementArrows.firstMatch.click()
+        XCTAssertTrue(says(app, "Switch when a limit reaches 96%").waitForExistence(timeout: 5))
+        XCTAssertEqual(claude.value as? Int, 0)
+        XCTAssertFalse(claudeShare.isEnabled)
+        claude.click()
+        XCTAssertTrue(claude.wait(until: "value == 1", timeout: 5))
+        XCTAssertTrue(says(app, "Switch when a limit reaches 95%").exists)
+        codex.click()
+        XCTAssertTrue(codex.wait(until: "value == 0", timeout: 5))
+        XCTAssertEqual(claude.value as? Int, 1)
+        XCTAssertTrue(claudeShare.isEnabled)
+    }
 
-        work.click()
-        XCTAssertTrue(work.wait(until: "value == 1", timeout: 5))
+    /// Kept warm-up accounts do not bring the removed section back into Limits.
+    @MainActor
+    func testLimitsHasNoWarmUpControls() {
+        let app = launch(.warmUp)
+        app.openSettings()
+        app.toolbars.buttons["Limits"].click()
+        XCTAssertTrue(app.control("settings.autoSwitch").waitForExistence(timeout: 5))
+        for identifier in [
+            "settings.warmFrom", "settings.warmTo", "settings.warmStanding",
+            "settings.warm.claude/personal", "settings.warm.claude/work",
+        ] {
+            XCTAssertFalse(app.control(identifier).exists, identifier)
+        }
     }
 
     /// What names the share a limit is switched at, as `words`: a text beside the stepper,

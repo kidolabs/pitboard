@@ -1,4 +1,4 @@
-//! Switching Claude Code by itself, before the account in use runs out.
+//! Switching an explicitly selected coding tool before the account in use runs out.
 //!
 //! An agent working through a task stops when its account reaches a limit, while another of
 //! the same person's accounts may sit there with room. So, where somebody asks for it,
@@ -14,8 +14,9 @@
 //! in a terminal. This is the one part of Pitboard that picks an account without anybody
 //! choosing it, so it is something a person turns on knowing what it is.
 //!
-//! Claude Code only. A running `codex` never follows a switch, so switching it would leave
-//! the agent it was meant to keep going on the account that ran out.
+//! Claude Code by default; Codex only when explicitly selected. A running `codex` never
+//! follows a switch: its native restart-required adoption report is preserved. Synchronizing
+//! another consumer such as Pi is a separate transaction participant, not a hot reload here.
 //!
 //! It decides from what Pitboard already knows, the readings every front end and every
 //! status line record, and asks nobody about usage to decide. It judges only a reading
@@ -143,7 +144,7 @@ impl Hold {
     }
 }
 
-/// What Pitboard would do about the Claude Code account in use, from what it knows now.
+/// What Pitboard would do about the selected tool's account in use, from what it knows now.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Decision {
     /// No limit has reached the share. `nearest` is the fullest of those still running, in
@@ -185,7 +186,7 @@ pub enum Auto {
         limit: Window,
         until: i64,
     },
-    /// Claude Code switched from `from` to `to`, as each is typed, because `limit` of
+    /// The selected tool switched from `from` to `to`, as each is typed, because `limit` of
     /// `from` reached the share.
     Switched {
         from: String,
@@ -345,13 +346,48 @@ fn sooner(a: Option<i64>, b: Option<i64>) -> Ordering {
     }
 }
 
-/// A reading Anthropic gave.
-fn answered(row: &Row) -> Option<&Snapshot> {
-    row.usage.as_ref().filter(|reading| reading.answered())
+/// Codex needs a recent answer of both windows, not a reset inferred from an old reading.
+/// Five minutes matches the normal all-account read cadence and settling period.
+const CODEX_FRESH_SECONDS: i64 = 300;
+
+/// A reading the service gave, sufficient to judge this tool. Claude's existing treatment
+/// of remembered readings and absent limits stays unchanged. OpenAI may return either
+/// window as null, which proves neither spare capacity nor the absence of that limit
+/// (`provider::codex::api::snapshot`, register `codex_usage_endpoint`).
+fn answered(row: &Row, now: i64) -> Option<&Snapshot> {
+    let reading = row.usage.as_ref().filter(|reading| reading.answered())?;
+    if row.provider != ProviderId::Codex {
+        return Some(reading);
+    }
+    let fresh = |at: Option<i64>| {
+        at.and_then(|at| now.checked_sub(at))
+            .is_some_and(|age| (0..=CODEX_FRESH_SECONDS).contains(&age))
+    };
+    let valid = |window: &Window| {
+        window.percent.is_finite()
+            && window.percent >= 0.0
+            && window.is_active
+            && window.resets_at.is_some_and(|at| at > now)
+            && window.length_seconds.is_none_or(|seconds| seconds > 0)
+    };
+    let covers = |kind: &str, seconds: i64| {
+        reading.windows.iter().any(|window| {
+            usage::limit_name(&window.kind) == kind
+                && window.scope.is_none()
+                && window.length_seconds.is_none_or(|length| length == seconds)
+        })
+    };
+    (fresh(reading.answered_at)
+        && fresh(reading.observed_at)
+        && reading.windows.iter().all(valid)
+        && covers("session", 5 * 3600)
+        && covers("weekly_all", 7 * 86_400))
+    .then_some(reading)
 }
 
-/// What Pitboard would do about `current`, the Claude Code account in use, from `rows`, as
-/// `state` and `ledger` stand at `now`.
+/// What Pitboard would do about `current`, the selected account in use, from trusted
+/// `rows`, as `state` and `ledger` stand at `now`. The I/O boundary in `judge` checks Codex
+/// cache provenance before calling this pure decision function.
 ///
 /// Every limit at the share is judged, the furthest past it first. One already switched away
 /// from, or tried for as often as it is tried, leaves the next to be judged on its own: where
@@ -374,7 +410,7 @@ pub(crate) fn decide(
     let Some((row, reading)) = rows
         .iter()
         .find(|row| row.key().as_ref() == Some(current))
-        .and_then(|row| Some((row, answered(row)?)))
+        .and_then(|row| Some((row, answered(row, now)?)))
     else {
         return Decision::NoReading;
     };
@@ -453,14 +489,14 @@ pub(crate) fn decide(
         .collect();
     let goes = || {
         rows.iter().filter(|row| {
-            row.provider == ProviderId::Claude
+            row.provider == current.provider
                 && row.key().is_some_and(|key| key != *current)
                 && row.switchable(now)
                 && !passed_over.contains(&row.id.as_str())
         })
     };
     let best = usage::preferred(goes().filter_map(|row| {
-        let theirs = answered(row)?;
+        let theirs = answered(row, now)?;
         let room = usage::room(
             &theirs.windows,
             theirs.lists_every_limit,
@@ -482,7 +518,7 @@ pub(crate) fn decide(
             limit,
             Skip::NoRoom {
                 unread: goes()
-                    .filter(|row| answered(row).is_none())
+                    .filter(|row| answered(row, now).is_none())
                     .filter_map(Row::key)
                     .map(|key| state.typed(&key))
                     .collect(),
@@ -551,8 +587,14 @@ impl Tried {
     }
 }
 
-fn path(ctx: &Context) -> PathBuf {
-    home::dir(ctx).join("autoswitch.json")
+fn path(ctx: &Context, which: ProviderId) -> PathBuf {
+    // Preserve Claude's deployed ledger byte-for-byte, including its unidentified backoff.
+    // Separate files isolate even identical account ids, attempts and unknown identities.
+    let name = match which {
+        ProviderId::Claude => "autoswitch.json".to_owned(),
+        other => format!("autoswitch-{}.json", other.code()),
+    };
+    home::dir(ctx).join(name)
 }
 
 /// A limit of an account, by the names a limit goes by.
@@ -568,18 +610,33 @@ fn entry(id: &str, limit: &Window) -> String {
 impl Ledger {
     /// What is kept, without the windows that have reset since it was written, as the next
     /// write would leave them out.
+    #[cfg(test)]
     pub(crate) fn load(ctx: &Context) -> Ledger {
-        let mut ledger: Ledger = ledger::load(&path(ctx));
+        Self::load_for(ctx, ProviderId::Claude)
+    }
+
+    pub(crate) fn load_for(ctx: &Context, which: ProviderId) -> Ledger {
+        let mut ledger: Ledger = ledger::load(&path(ctx, which));
         let now = ctx.now();
         ledger.limits.retain(|_, tried| tried.kept(now));
         ledger
     }
 
     /// Kept whole, without the windows that have reset.
+    #[cfg(test)]
     pub(crate) fn save(&mut self, ctx: &Context, permit: Permit) -> crate::error::Result<()> {
+        self.save_for(ctx, permit, ProviderId::Claude)
+    }
+
+    pub(crate) fn save_for(
+        &mut self,
+        ctx: &Context,
+        permit: Permit,
+        which: ProviderId,
+    ) -> crate::error::Result<()> {
         let now = ctx.now();
         self.limits.retain(|_, tried| tried.kept(now));
-        ledger::save(permit, &path(ctx), self)
+        ledger::save(permit, &path(ctx, which), self)
     }
 
     /// What was tried for this window of `limit`, where anything was.
@@ -694,17 +751,34 @@ impl Ledger {
 /// that record is in doubt, a switch may be due, a reason not to switch was not yet recorded,
 /// or another run is in the middle of a switch, only the decision under the lock can say,
 /// from whose login is stored by then.
+#[cfg(test)]
 pub(crate) fn look(ctx: &Context, state: &State, threshold: Threshold) -> Look {
+    look_for(ctx, state, ProviderId::Claude, threshold)
+}
+
+pub(crate) fn look_for(
+    ctx: &Context,
+    state: &State,
+    which: ProviderId,
+    threshold: Threshold,
+) -> Look {
+    if !which.reads_usage() {
+        return Look::Stands(Box::new(Auto::NotWatching {
+            why: Blind::NoReading {
+                account: which.code().into(),
+            },
+        }));
+    }
     let unfinished = crate::switch::unfinished(ctx);
-    if let Some(why) = blind(ctx, unfinished) {
+    if let Some(why) = blind(ctx, which, unfinished) {
         return Look::Stands(Box::new(Auto::NotWatching { why }));
     }
     if unfinished.is_some() {
         return Look::Act;
     }
     let now = ctx.now();
-    let ledger = Ledger::load(ctx);
-    let known = in_use::known(ctx, state, ProviderId::Claude);
+    let ledger = Ledger::load_for(ctx, which);
+    let known = in_use::known(ctx, state, which);
     let known_at = known.last.as_ref().map(|last| last.known_at);
     if let Some(why) = ledger.unidentified(known_at, now) {
         return Look::Stands(Box::new(Auto::NotWatching { why }));
@@ -712,7 +786,7 @@ pub(crate) fn look(ctx: &Context, state: &State, threshold: Threshold) -> Look {
     if known.doubt.is_some() {
         return Look::Act;
     }
-    let account = match watched(state, known.owner()) {
+    let account = match watched(state, which, known.owner()) {
         Ok(account) => account,
         Err(why) => return Look::Stands(Box::new(Auto::NotWatching { why })),
     };
@@ -727,22 +801,30 @@ pub(crate) fn look(ctx: &Context, state: &State, threshold: Threshold) -> Look {
 /// finished, which is a change for somebody to make, or Claude Code keeps its login where
 /// Pitboard does not act. Asked before anything else, so the automatic switch never settles
 /// either on its own. A switch another run is making waits on nobody, and is not one.
-fn blind(ctx: &Context, unfinished: Option<crate::switch::Unfinished>) -> Option<Blind> {
+fn blind(
+    ctx: &Context,
+    which: ProviderId,
+    unfinished: Option<crate::switch::Unfinished>,
+) -> Option<Blind> {
     if unfinished == Some(crate::switch::Unfinished::Interrupted) {
         Some(Blind::SwitchInterrupted)
-    } else if crate::settings::custom_oauth(ctx) {
+    } else if which == ProviderId::Claude && crate::settings::custom_oauth(ctx) {
         Some(Blind::CustomOauth)
     } else {
         None
     }
 }
 
-/// The account whose login Claude Code has stored, `owner`'s, or why it cannot be watched:
+/// The account whose login the selected tool has stored, or why it cannot be watched:
 /// there is none, or nobody enrolled it.
-pub(crate) fn watched<'a>(state: &'a State, owner: Option<&Owner>) -> Result<&'a Account, Blind> {
+pub(crate) fn watched<'a>(
+    state: &'a State,
+    which: ProviderId,
+    owner: Option<&Owner>,
+) -> Result<&'a Account, Blind> {
     let owner = owner.ok_or(Blind::NothingSignedIn)?;
     state
-        .account_of(ProviderId::Claude, owner)
+        .account_of(which, owner)
         .ok_or_else(|| Blind::NotEnrolled {
             email: owner.email.clone(),
         })
@@ -759,8 +841,8 @@ pub(crate) enum Judged {
     Stands(Auto),
 }
 
-/// What Pitboard would do about `account`, the Claude Code account in use, from the readings
-/// it holds, as `state` and `ledger` stand at `now`. Where Claude Code signs in another way, a
+/// What Pitboard would do about `account`, the selected account in use, from the readings
+/// it holds, as `state` and `ledger` stand at `now`. Where its tool signs in another way, a
 /// switch would change nothing its sessions use.
 pub(crate) fn judge(
     ctx: &Context,
@@ -770,7 +852,20 @@ pub(crate) fn judge(
     threshold: Threshold,
     now: i64,
 ) -> Judged {
-    let rows = crate::status::gather_offline(ctx, state).rows;
+    let mut rows = crate::status::gather_offline(ctx, state).rows;
+    if account.provider() == ProviderId::Codex {
+        let raw = usage::readings::codex_raw(ctx);
+        for row in rows
+            .iter_mut()
+            .filter(|row| row.provider == ProviderId::Codex)
+        {
+            // Bind the marker to the exact snapshot read. A legacy cache, an old writer,
+            // or a concurrent replacement cannot make merged windows actionable.
+            if raw.get(&row.id) != row.usage.as_ref() {
+                row.usage = None;
+            }
+        }
+    }
     let key = account.key();
     let typed = state.typed(&key);
     let plan = match decide(state, &key, &rows, ledger, threshold, now) {
@@ -797,7 +892,12 @@ pub(crate) fn judge(
         Decision::Hold(hold) => return Judged::Hold(hold),
         Decision::Switch(plan) => plan,
     };
-    let overridden = crate::provider::claude_code().overridden_by(ctx);
+    let crate::provider::LoginKind::Document(tool) = crate::provider::of(account.provider()) else {
+        return Judged::Stands(Auto::NotWatching {
+            why: Blind::NoReading { account: typed },
+        });
+    };
+    let overridden = tool.overridden_by(ctx);
     if overridden.is_empty() {
         return Judged::Switch(plan);
     }
@@ -859,11 +959,17 @@ mod tests {
     fn state_of(rows: &[Row]) -> State {
         let mut state = State::default();
         for row in rows {
-            state.accounts.push(account(
+            let mut enrolled = account(
                 row.label.as_deref().unwrap(),
                 &row.account_uuid,
                 row.parked.clone(),
-            ));
+            );
+            if row.provider == ProviderId::Codex {
+                enrolled.detail = crate::state::Detail::Codex {
+                    workspace_id: Some(row.account_uuid.clone()),
+                };
+            }
+            state.accounts.push(enrolled);
         }
         state
     }
@@ -942,6 +1048,216 @@ mod tests {
             false,
             vec![window("session", 10.0), window("weekly_all", 30.0)],
         )
+    }
+
+    fn codex(mut row: Row) -> Row {
+        row.provider = ProviderId::Codex;
+        let reading = row.usage.as_mut().expect("a reading");
+        reading.lists_every_limit = false;
+        for window in &mut reading.windows {
+            window.length_seconds = usage::anthropic_window_length(&window.kind);
+            window.kind = match window.kind.as_str() {
+                "session" => "five_hour".into(),
+                "weekly_all" => "seven_day".into(),
+                _ => window.kind.clone(),
+            };
+        }
+        row
+    }
+
+    #[test]
+    fn provider_ledgers_separate_attempts_holds_and_unidentified_backoff() {
+        let m = crate::switch::harness::machine("autoswitch-provider-ledgers");
+        let claude_rows = [work_at(96.0), spare()];
+        let codex_rows = [codex(work_at(96.0)), codex(spare())];
+        let claude_plan = plan(&claude_rows);
+        let Decision::Switch(codex_plan) = decided(&codex_rows) else {
+            panic!("Codex plan")
+        };
+        let mut claude = Ledger::default();
+        claude.attempt(&claude_plan, NOW);
+        claude.switched(&claude_plan);
+        claude.not_told("Claude unavailable".into(), None, NOW);
+        claude.save(&m.ctx, Permit::for_a_test()).unwrap();
+        let claude_bytes = std::fs::read(path(&m.ctx, ProviderId::Claude)).unwrap();
+        let mut codex = Ledger::load_for(&m.ctx, ProviderId::Codex);
+        assert_eq!(codex, Ledger::default());
+        assert_eq!(
+            to(&decided_with(
+                &state_of(&codex_rows),
+                &codex_rows,
+                &codex,
+                Threshold::DEFAULT,
+                NOW
+            )),
+            Some("spare")
+        );
+        codex.attempt(&codex_plan, NOW);
+        codex.pass_over(&codex_plan, "spare");
+        codex.not_told("Codex unavailable".into(), None, NOW);
+        codex
+            .save_for(&m.ctx, Permit::for_a_test(), ProviderId::Codex)
+            .unwrap();
+        assert_eq!(Ledger::load(&m.ctx), claude);
+        assert_eq!(
+            std::fs::read(path(&m.ctx, ProviderId::Claude)).unwrap(),
+            claude_bytes
+        );
+        assert_eq!(Ledger::load_for(&m.ctx, ProviderId::Codex), codex);
+        assert_ne!(
+            claude.unidentified(None, NOW),
+            codex.unidentified(None, NOW)
+        );
+        assert_eq!(
+            Ledger::load(&m.ctx).limits.keys().collect::<Vec<_>>(),
+            claude.limits.keys().collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            decided_with(
+                &state_of(&codex_rows),
+                &codex_rows,
+                &codex,
+                Threshold::DEFAULT,
+                NOW
+            ),
+            Decision::Waiting { .. }
+        ));
+        assert!(no_room(&decided_with(
+            &state_of(&codex_rows),
+            &codex_rows,
+            &codex,
+            Threshold::DEFAULT,
+            NOW + RETRY_SECONDS
+        )));
+    }
+
+    #[test]
+    fn codex_preserves_threshold_settling_and_attempt_limits() {
+        let rows = [codex(work_at(85.0)), codex(spare())];
+        let mut state = state_of(&rows);
+        let threshold = Threshold::new(80).unwrap();
+        let mut ledger = Ledger::default();
+        assert!(matches!(decided(&rows), Decision::Below { .. }));
+        let Decision::Switch(plan) = decided_with(&state, &rows, &ledger, threshold, NOW) else {
+            panic!("lower threshold")
+        };
+        put_in_use(&mut state, NOW - 10);
+        assert!(matches!(
+            decided_with(&state, &rows, &ledger, threshold, NOW),
+            Decision::Hold(Hold {
+                why: Skip::Settling { .. },
+                ..
+            })
+        ));
+        put_in_use(&mut state, NOW - SETTLING_SECONDS);
+        for _ in 0..ATTEMPTS {
+            ledger.attempt(&plan, NOW);
+        }
+        assert!(matches!(
+            decided_with(&state, &rows, &ledger, threshold, NOW),
+            Decision::Hold(Hold {
+                why: Skip::GaveUp,
+                ..
+            })
+        ));
+        let mut ledger = Ledger::default();
+        ledger.attempt(&plan, NOW);
+        ledger.switched(&plan);
+        assert!(matches!(
+            decided_with(&state, &rows, &ledger, threshold, NOW),
+            Decision::Hold(Hold {
+                why: Skip::AlreadyLeft,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn codex_freshness_is_bounded_by_the_answer_not_only_a_new_observation() {
+        let current = codex(work_at(96.0));
+        let mut candidate = codex(spare());
+        let reading = candidate.usage.as_mut().unwrap();
+        reading.answered_at = Some(NOW - 300);
+        assert_eq!(to(&decided(&[current, candidate])), Some("spare"));
+        let mut candidate = codex(spare());
+        let reading = candidate.usage.as_mut().unwrap();
+        reading.answered_at = Some(NOW - 301);
+        reading.observed_at = Some(NOW);
+        assert!(no_room(&decided(&[codex(work_at(96.0)), candidate])));
+    }
+
+    #[test]
+    fn selected_codex_only_chooses_codex_candidates() {
+        let claude = row(
+            "claude-spare",
+            false,
+            vec![window("session", 0.0), window("weekly_all", 0.0)],
+        );
+        let decision = decided(&[codex(work_at(96.0)), claude, codex(spare())]);
+        let Decision::Switch(plan) = decision else {
+            panic!("a Codex switch, not {decision:?}");
+        };
+        assert_eq!(plan.from.provider, ProviderId::Codex);
+        assert_eq!(plan.to, Key::new(ProviderId::Codex, "spare"));
+    }
+
+    #[test]
+    fn codex_current_needs_both_fresh_valid_windows() {
+        for bad in 0..8 {
+            let mut work = codex(work_at(96.0));
+            let reading = work.usage.as_mut().unwrap();
+            match bad {
+                0 => {
+                    reading.windows.pop();
+                }
+                1 => reading.answered_at = Some(NOW - 301),
+                2 => reading.observed_at = Some(NOW + 1),
+                3 => reading.windows[1].percent = f64::NAN,
+                4 => reading.windows[1].resets_at = None,
+                5 => reading.windows[1].resets_at = Some(NOW),
+                6 => reading.windows[1].length_seconds = Some(3600),
+                _ => reading.windows[1].is_active = false,
+            }
+            assert_eq!(
+                decided(&[work, codex(spare())]),
+                Decision::NoReading,
+                "case {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_candidates_never_infer_room_from_partial_or_stale_windows() {
+        assert_eq!(
+            to(&decided(&[codex(work_at(96.0)), codex(spare())])),
+            Some("spare")
+        );
+        for bad in 0..10 {
+            let mut spare = codex(spare());
+            let reading = spare.usage.as_mut().unwrap();
+            match bad {
+                0 => {
+                    reading.windows.pop();
+                }
+                1 => {
+                    reading.windows.remove(0);
+                }
+                2 => reading.answered_at = Some(NOW - 301),
+                3 => reading.answered_at = None,
+                4 => reading.windows[1].percent = f64::NAN,
+                5 => reading.windows[1].percent = -1.0,
+                6 => reading.windows[1].resets_at = None,
+                7 => reading.windows[1].resets_at = Some(NOW),
+                8 => reading.windows[1].length_seconds = Some(3600),
+                _ => reading.windows[1].percent = 95.0,
+            }
+            // Even an erroneous complete-list flag cannot prove absent Codex capacity.
+            reading.lists_every_limit = true;
+            assert!(
+                no_room(&decided(&[codex(work_at(96.0)), spare])),
+                "case {bad}"
+            );
+        }
     }
 
     /// Room too, but less of it than `spare` has.
@@ -1077,11 +1393,9 @@ mod tests {
         assert_eq!(decided(&[work, spare()]), Decision::NoReading);
     }
 
-    /// A running `codex` never follows a switch, so Codex is never switched by itself, and
-    /// never switched to: only Claude Code's account in use is judged, against Claude Code's
-    /// accounts.
+    /// The legacy Claude decision never switches to Codex, nor judges Codex's current row.
     #[test]
-    fn codex_is_never_switched() {
+    fn claude_decisions_never_switch_codex() {
         let codex = |mut row: Row| {
             row.provider = ProviderId::Codex;
             row

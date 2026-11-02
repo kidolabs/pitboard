@@ -6,6 +6,7 @@ pub(crate) mod budget;
 pub mod pace;
 pub(crate) mod readings;
 
+use crate::provider::ProviderId;
 use crate::time;
 use serde_json::Value;
 
@@ -153,6 +154,18 @@ pub(crate) fn may_still_run(at: i64, now: i64) -> bool {
     at > now || same_reset(at, now)
 }
 
+/// Claude's original fixture fold. Production callers name their actual provider.
+#[cfg(test)]
+pub(crate) fn answered(known: Option<&Snapshot>, answer: &Snapshot, now: i64) -> Snapshot {
+    answered_for(ProviderId::Claude, known, answer, now)
+}
+
+/// Whether this answer is not older than the last accepted answer. Shared with the cache:
+/// ignoring an answer must also ignore its claim to raw-window provenance.
+pub(crate) fn accepts_answer(known: Option<&Snapshot>, answer: &Snapshot, now: i64) -> bool {
+    answer.answered_at >= known.and_then(|known| known.answered_at.filter(|at| *at <= now))
+}
+
 /// One account's reading once its service has answered `answer` for that account's own
 /// login, as of the answer's `answered_at`.
 ///
@@ -170,12 +183,21 @@ pub(crate) fn may_still_run(at: i64, now: i64) -> bool {
 /// than the last one known changes nothing. A time later than `now` was stamped by a clock
 /// that ran ahead and orders nothing: taken as one, it held back every answer until the
 /// clock caught up.
-pub(crate) fn answered(known: Option<&Snapshot>, answer: &Snapshot, now: i64) -> Snapshot {
+///
+/// The actual provider is passed, never inferred from window names. Claude keeps the
+/// merge policy above. Codex keeps only windows in this raw answer:
+/// an omitted window is unknown, not freshly measured and not proof of spare capacity.
+pub(crate) fn answered_for(
+    provider: ProviderId,
+    known: Option<&Snapshot>,
+    answer: &Snapshot,
+    now: i64,
+) -> Snapshot {
     let Some(known) = known else {
         return answer.clone();
     };
     let stamped = |at: Option<i64>| at.filter(|at| *at <= now);
-    if answer.answered_at < stamped(known.answered_at) {
+    if !accepts_answer(Some(known), answer, now) {
         return known.clone();
     }
     let moved_since = stamped(known.observed_at) >= answer.answered_at;
@@ -193,7 +215,7 @@ pub(crate) fn answered(known: Option<&Snapshot>, answer: &Snapshot, now: i64) ->
         },
         None => given.clone(),
     };
-    let windows = if answer.lists_every_limit {
+    let windows = if provider == ProviderId::Codex || answer.lists_every_limit {
         answer.windows.iter().map(take).collect()
     } else {
         let answer_of = |had: &Window| answer.windows.iter().find(|given| given.same_limit(had));
@@ -664,12 +686,10 @@ mod tests {
         );
     }
 
-    /// Whether OpenAI's null window is one not running is not measured, so a window its
-    /// answer leaves out stands while it runs, and where it was: `pitboard status` and the
-    /// menu list limits in a reading's order. One whose reset has passed, or that has none,
-    /// is not running.
+    /// Claude's incomplete answers keep running limits they cannot describe. This policy
+    /// is not used for Codex, whose raw windows must not inherit aggregate freshness.
     #[test]
-    fn a_window_openai_leaves_out_stands_until_its_reset() {
+    fn an_incomplete_claude_answer_keeps_running_limits_until_their_reset() {
         let known = held(
             vec![
                 measured("five_hour", 30.0, Some(NOW + HOUR)),
@@ -695,6 +715,52 @@ mod tests {
             shares(&answered(Some(&known), &whole, NOW)),
             [("seven_day", 45.0)],
             "where the answer lists every limit"
+        );
+    }
+
+    #[test]
+    fn codex_raw_answers_drop_omissions_but_preserve_late_higher_reported_usage() {
+        let known = held(
+            vec![
+                measured("five_hour", 96.0, Some(NOW + HOUR)),
+                measured("seven_day", 40.0, Some(NOW + 50 * HOUR)),
+            ],
+            NOW,
+            Some(NOW - 600),
+        );
+        let given = Snapshot {
+            lists_every_limit: false,
+            ..answer(
+                vec![measured("five_hour", 20.0, Some(NOW + HOUR))],
+                NOW - 60,
+            )
+        };
+        let reading = answered_for(ProviderId::Codex, Some(&known), &given, NOW);
+        assert_eq!(shares(&reading), [("five_hour", 96.0)]);
+        assert_eq!(reading.observed_at, Some(NOW));
+        assert_eq!(reading.answered_at, Some(NOW - 60));
+        assert!(!reading.lists_every_limit, "unknown is not an absent limit");
+        assert_eq!(
+            shares(&answered_for(ProviderId::Claude, Some(&known), &given, NOW)),
+            [("five_hour", 96.0), ("seven_day", 40.0)],
+            "Claude still retains its omitted running limit"
+        );
+        let late = Snapshot {
+            answered_at: Some(NOW - 601),
+            ..given.clone()
+        };
+        assert_eq!(
+            answered_for(ProviderId::Codex, Some(&known), &late, NOW),
+            known
+        );
+        let empty = Snapshot {
+            windows: Vec::new(),
+            ..given
+        };
+        assert!(
+            answered_for(ProviderId::Codex, Some(&known), &empty, NOW)
+                .windows
+                .is_empty()
         );
     }
 

@@ -114,7 +114,13 @@ private final class Told: @unchecked Sendable {
     let model = AppModel(model: standIn)
     model.send(.switchTo(qualified: "codex/spare"))
     model.send(.closeSheet)
-    #expect(standIn.sent == [.switchTo(qualified: "codex/spare"), .closeSheet])
+    model.send(.setAutoSwitch(on: true, at: 90))
+    model.send(.setCodexAutoSwitch(on: true, at: 80))
+    #expect(
+        standIn.sent == [
+            .switchTo(qualified: "codex/spare"), .closeSheet,
+            .setAutoSwitch(on: true, at: 90), .setCodexAutoSwitch(on: true, at: 80),
+        ])
     model.shutdown()
     #expect(standIn.stopped == 1)
 }

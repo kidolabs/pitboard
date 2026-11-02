@@ -9,10 +9,11 @@
 //! so when each showed its own numbers and whoever wrote last won, sessions on one account
 //! disagreed with each other and with the menu bar. An answer from the service sets an
 //! account's reading, and a session's numbers only move a limit an answer gave (see
-//! [`crate::usage::answered`] and [`crate::usage::moved`]), so a reading is the newest thing
+//! [`crate::usage::answered_for`] and [`crate::usage::moved`]), so a reading is the newest thing
 //! any of them has seen of that account. Nothing here is secret.
 
 use crate::context::Context;
+use crate::provider::ProviderId;
 use crate::service::Permit;
 use crate::usage::{Snapshot, Source, Window};
 use crate::{atomic, home};
@@ -23,16 +24,43 @@ fn path(ctx: &Context) -> PathBuf {
     home::dir(ctx).join("usage.json")
 }
 
-pub(crate) fn load(ctx: &Context) -> HashMap<String, Snapshot> {
+/// Private disk envelope: public Snapshot and its JSON shape stay unchanged. An older
+/// writer deserializes only Snapshot, drops this marker, and therefore fails closed.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Record {
+    #[serde(flatten)]
+    snapshot: Snapshot,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    codex_raw_windows: bool,
+}
+
+fn records(ctx: &Context) -> HashMap<String, Record> {
     std::fs::read_to_string(path(ctx))
         .ok()
-        .and_then(|raw| serde_json::from_str::<HashMap<String, Snapshot>>(&raw).ok())
+        .and_then(|raw| serde_json::from_str::<HashMap<String, Record>>(&raw).ok())
         .unwrap_or_default()
         .into_iter()
-        .map(|(uuid, mut snapshot)| {
-            snapshot.source = Source::Remembered;
-            (uuid, snapshot)
+        .map(|(uuid, mut record)| {
+            record.snapshot.source = Source::Remembered;
+            (uuid, record)
         })
+        .collect()
+}
+
+pub(crate) fn load(ctx: &Context) -> HashMap<String, Snapshot> {
+    records(ctx)
+        .into_iter()
+        .map(|(id, record)| (id, record.snapshot))
+        .collect()
+}
+
+/// Only readings founded on an accepted provider-aware raw Codex answer. Return the
+/// snapshot too, so a judge cannot attach provenance to a different concurrent reading.
+pub(crate) fn codex_raw(ctx: &Context) -> HashMap<String, Snapshot> {
+    records(ctx)
+        .into_iter()
+        .filter(|(_, record)| record.codex_raw_windows)
+        .map(|(id, record)| (id, record.snapshot))
         .collect()
 }
 
@@ -57,17 +85,44 @@ pub(crate) fn forget(ctx: &Context, permit: Permit, id: &str) {
     change(ctx, permit, |all| all.remove(id).is_some());
 }
 
-/// Answers about accounts, each recorded as that account's reading as
-/// [`crate::usage::answered`] folds it in.
+/// The existing Claude fixture helper. Production writers must name the actual provider.
+#[cfg(test)]
 pub(crate) fn answered(ctx: &Context, permit: Permit, answers: &[(String, Snapshot)]) {
+    answered_for(
+        ctx,
+        permit,
+        &answers
+            .iter()
+            .map(|(id, answer)| (ProviderId::Claude, id.clone(), answer.clone()))
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// Raw service answers, each folded under the usage lock with its actual provider.
+/// Only an accepted new Codex answer can mint provenance; stale answers preserve what
+/// was already known, and Claude answers clear any Codex claim for the affected account.
+pub(crate) fn answered_for(
+    ctx: &Context,
+    permit: Permit,
+    answers: &[(ProviderId, String, Snapshot)],
+) {
     let now = ctx.now();
     change(ctx, permit, |all| {
         let mut changed = false;
-        for (id, answer) in answers {
-            let mut next = crate::usage::answered(all.get(id), answer, now);
+        for (provider, id, answer) in answers {
+            let known = all.get(id);
+            let snapshot = known.map(|record| &record.snapshot);
+            if !crate::usage::accepts_answer(snapshot, answer, now) {
+                continue;
+            }
+            let mut next = crate::usage::answered_for(*provider, snapshot, answer, now);
             // What it is once stored, as `load` says of everything here.
             next.source = Source::Remembered;
-            if all.get(id) != Some(&next) {
+            let next = Record {
+                snapshot: next,
+                codex_raw_windows: *provider == ProviderId::Codex && answer.answered(),
+            };
+            if known != Some(&next) {
                 all.insert(id.clone(), next);
                 changed = true;
             }
@@ -82,10 +137,12 @@ pub(crate) fn answered(ctx: &Context, permit: Permit, answers: &[(String, Snapsh
 pub(crate) fn moved(ctx: &Context, permit: Permit, id: &str, passed: &[Window]) {
     let now = ctx.now();
     change(ctx, permit, |all| {
-        let Some(next) = all
-            .get(id)
-            .and_then(|known| crate::usage::moved(known, passed, now))
-        else {
+        let Some(next) = all.get(id).and_then(|known| {
+            crate::usage::moved(&known.snapshot, passed, now).map(|snapshot| Record {
+                snapshot,
+                codex_raw_windows: known.codex_raw_windows,
+            })
+        }) else {
             return false;
         };
         all.insert(id.to_owned(), next);
@@ -99,14 +156,14 @@ pub(crate) fn moved(ctx: &Context, permit: Permit, id: &str, passed: &[Window]) 
 /// second, and mostly passes what is already here. A change is made under a lock, to what
 /// is here once the lock is held, so two front ends writing at once cannot each write back
 /// the other's older copy.
-fn change(ctx: &Context, permit: Permit, fold: impl Fn(&mut HashMap<String, Snapshot>) -> bool) {
-    if !fold(&mut load(ctx)) {
+fn change(ctx: &Context, permit: Permit, fold: impl Fn(&mut HashMap<String, Record>) -> bool) {
+    if !fold(&mut records(ctx)) {
         return;
     }
     let Some(_held) = exclusive(ctx, permit) else {
         return;
     };
-    let mut all = load(ctx);
+    let mut all = records(ctx);
     if fold(&mut all)
         && let Ok(body) = serde_json::to_string(&all)
     {
@@ -227,10 +284,10 @@ mod tests {
         assert_eq!(work.answered_at, Some(NOW));
     }
 
-    /// One file holds both tools' readings, and each answer is recorded by what it is:
-    /// Anthropic's lists every limit, and a window OpenAI's leaves out stands while it runs.
+    /// One file holds both tools' readings; only Claude's incomplete answers may retain
+    /// omitted running windows. Providers are passed explicitly, not read from row names.
     #[test]
-    fn each_answer_is_recorded_by_whether_it_lists_every_limit() {
+    fn each_answer_is_recorded_by_its_provider() {
         let (ctx, _scratch) = machine();
         let given = |kinds: &[&str], at: i64, lists_every_limit: bool| Snapshot {
             windows: kinds.iter().map(|kind| window(kind, 30.0)).collect(),
@@ -243,12 +300,12 @@ mod tests {
             (NOW - 60, &["five_hour", "seven_day"][..]),
             (NOW, &["seven_day"]),
         ] {
-            answered(
+            answered_for(
                 &ctx,
                 Permit::for_a_test(),
                 &[
-                    ("claude".into(), given(kinds, at, true)),
-                    ("codex".into(), given(kinds, at, false)),
+                    (ProviderId::Claude, "claude".into(), given(kinds, at, false)),
+                    (ProviderId::Codex, "codex".into(), given(kinds, at, false)),
                 ],
             );
         }
@@ -259,11 +316,151 @@ mod tests {
                 .map(|w| w.kind.clone())
                 .collect()
         };
-        assert_eq!(kinds("claude"), ["seven_day"]);
-        assert_eq!(kinds("codex"), ["five_hour", "seven_day"]);
+        assert_eq!(kinds("claude"), ["five_hour", "seven_day"]);
+        assert_eq!(kinds("codex"), ["seven_day"]);
+        assert!(!load(&ctx)["codex"].lists_every_limit);
+        assert!(codex_raw(&ctx).contains_key("codex"));
+        assert!(!codex_raw(&ctx).contains_key("claude"));
+    }
+
+    #[test]
+    fn stale_codex_answers_cannot_bless_a_legacy_cache() {
+        let (ctx, _scratch) = machine();
+        let legacy = answer("five_hour", 10.0, NOW);
+        std::fs::write(
+            path(&ctx),
+            serde_json::to_vec(&HashMap::from([("work", legacy.clone())])).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(path(&ctx)).unwrap();
+        assert!(codex_raw(&ctx).is_empty());
+        answered_for(
+            &ctx,
+            Permit::for_a_test(),
+            &[(
+                ProviderId::Codex,
+                "work".into(),
+                answer("seven_day", 20.0, NOW - 1),
+            )],
+        );
+        assert_eq!(
+            std::fs::read(path(&ctx)).unwrap(),
+            before,
+            "an ignored answer changes nothing"
+        );
         assert!(
-            load(&ctx)["claude"].lists_every_limit,
-            "and kept as it was said"
+            codex_raw(&ctx).is_empty(),
+            "starting a new reader establishes no provenance"
+        );
+
+        answered_for(
+            &ctx,
+            Permit::for_a_test(),
+            &[(ProviderId::Codex, "work".into(), legacy)],
+        );
+        let trusted = std::fs::read(path(&ctx)).unwrap();
+        assert!(
+            codex_raw(&ctx).contains_key("work"),
+            "an accepted answer can mint it even if shares are unchanged"
+        );
+        answered_for(
+            &ctx,
+            Permit::for_a_test(),
+            &[(
+                ProviderId::Codex,
+                "work".into(),
+                answer("seven_day", 20.0, NOW - 1),
+            )],
+        );
+        assert_eq!(std::fs::read(path(&ctx)).unwrap(), trusted);
+        assert!(
+            codex_raw(&ctx).contains_key("work"),
+            "a stale answer also cannot revoke prior provenance"
+        );
+    }
+
+    #[test]
+    fn raw_provenance_round_trips_survives_other_writes_and_old_writers_lose_it() {
+        let (ctx, _scratch) = machine();
+        answered_for(
+            &ctx,
+            Permit::for_a_test(),
+            &[(
+                ProviderId::Codex,
+                "work".into(),
+                answer("five_hour", 10.0, NOW - 60),
+            )],
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path(&ctx)).unwrap()).unwrap();
+        assert_eq!(saved["work"]["codex_raw_windows"], true);
+        let public = serde_json::to_value(&load(&ctx)["work"]).unwrap();
+        assert!(
+            public.get("codex_raw_windows").is_none(),
+            "public Snapshot JSON is unchanged"
+        );
+
+        answered(
+            &ctx,
+            Permit::for_a_test(),
+            &[("claude".into(), answer("session", 20.0, NOW))],
+        );
+        answered_for(
+            &ctx,
+            Permit::for_a_test(),
+            &[(
+                ProviderId::Codex,
+                "other".into(),
+                answer("seven_day", 30.0, NOW),
+            )],
+        );
+        passes(&ctx, "five_hour", 15.0);
+        assert_eq!(codex_raw(&ctx)["work"].windows[0].percent, 15.0);
+        assert_eq!(codex_raw(&ctx)["work"].answered_at, Some(NOW - 60));
+        assert_eq!(codex_raw(&ctx)["work"].observed_at, Some(NOW));
+        forget(&ctx, Permit::for_a_test(), "other");
+        assert!(codex_raw(&ctx).contains_key("work"));
+        assert!(!codex_raw(&ctx).contains_key("claude"));
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path(&ctx)).unwrap()).unwrap();
+        assert!(
+            saved["claude"].get("codex_raw_windows").is_none(),
+            "false markers are not serialized"
+        );
+
+        // Exactly what an old reader/writer does: unknown fields disappear on write.
+        let old_reader: HashMap<String, Snapshot> =
+            serde_json::from_slice(&std::fs::read(path(&ctx)).unwrap()).unwrap();
+        std::fs::write(path(&ctx), serde_json::to_vec(&old_reader).unwrap()).unwrap();
+        assert_eq!(load(&ctx), old_reader);
+        assert!(
+            codex_raw(&ctx).is_empty(),
+            "marker loss fails closed on a fresh load"
+        );
+    }
+
+    #[test]
+    fn only_accepted_answered_codex_writes_mint_the_marker() {
+        let (ctx, _scratch) = machine();
+        let mut given = answer("five_hour", 10.0, NOW);
+        given.answered_at = None;
+        answered_for(
+            &ctx,
+            Permit::for_a_test(),
+            &[(ProviderId::Codex, "work".into(), given)],
+        );
+        assert!(codex_raw(&ctx).is_empty());
+        let given = answer("five_hour", 10.0, NOW);
+        answered_for(
+            &ctx,
+            Permit::for_a_test(),
+            &[(ProviderId::Codex, "work".into(), given.clone())],
+        );
+        assert!(codex_raw(&ctx).contains_key("work"));
+        answered(&ctx, Permit::for_a_test(), &[("work".into(), given)]);
+        assert!(
+            codex_raw(&ctx).is_empty(),
+            "a Claude/default write cannot vouch for raw Codex windows"
         );
     }
 

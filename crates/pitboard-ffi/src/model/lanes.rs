@@ -587,11 +587,14 @@ impl Worker {
                 qualified,
                 reopen: None,
             },
-            Job::AutoLook { at } => Answer::AutoLooked {
-                looked: core.auto_look(at),
+            Job::AutoLook { provider, at } => Answer::AutoLooked {
+                provider,
+                at,
+                looked: core.auto_look(provider, at),
             },
-            Job::AutoSwitch { at } => Answer::AutoSwitched {
-                done: core.auto_switch(at),
+            Job::AutoSwitch { provider, at } => Answer::AutoSwitched {
+                provider,
+                done: core.auto_switch(provider, at),
             },
             Job::WarmUp => Answer::WarmedUp {
                 asked: None,
@@ -1048,8 +1051,10 @@ mod tests {
     /// change, made one at a time with every other.
     #[test]
     fn a_look_whether_to_switch_by_itself_runs_with_the_reads() {
-        assert_eq!(Job::AutoLook { at: 95 }.lane(), Lane::Reads);
-        assert_eq!(Job::AutoSwitch { at: 95 }.lane(), Lane::Changes);
+        for provider in [ProviderId::Claude, ProviderId::Codex] {
+            assert_eq!(Job::AutoLook { provider, at: 95 }.lane(), Lane::Reads);
+            assert_eq!(Job::AutoSwitch { provider, at: 95 }.lane(), Lane::Changes);
+        }
     }
 
     /// AppModelTests.swift's onlyARunningAppHoldingTheToolIsAskedAbout once more, on the real

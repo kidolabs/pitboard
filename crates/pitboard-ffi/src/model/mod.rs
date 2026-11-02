@@ -340,6 +340,9 @@ pub enum Intent {
     /// as `MachineShown::auto_switch` says by `enabled`. Turned on, or at another share, the
     /// core looks at once whether to switch.
     SetAutoSwitch { on: bool, at: u8 },
+    /// Independent Codex/Pi automatic switching. Source remains DRAFT until the native Pi
+    /// transaction participant is integrated; this preference is off by default.
+    SetCodexAutoSwitch { on: bool, at: u8 },
     /// Warm up the account `qualified` names from now on, or stop: its own menu's **Warm Up
     /// Automatically**, or its row under the settings' warm-up. Kept by the core in Pitboard's
     /// directory, which the command line reads too. Turned on, an account due is warmed up at

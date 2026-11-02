@@ -1581,6 +1581,7 @@ fn a_switch_that_sessions_take_at_renewal_counts_down_nothing() {
     assert_eq!(left_behind.until, None);
     assert_eq!(
         crate::present::auto_switched_notice(
+            pitboard_core::provider::ProviderId::Claude,
             "personal",
             "work",
             "96% of its 5-hour limit",
