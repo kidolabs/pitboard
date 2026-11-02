@@ -167,11 +167,11 @@ private func settingsHeight(_ tab: SettingsView.Tab, warming: Int = 0) -> CGFloa
     return NSHostingView(rootView: settings.defaultAppStorage(defaults)).fittingSize.height
 }
 
-// Only Limits lists accounts, so only it can outgrow a 1024 x 768 screen and scroll.
+// Warm-up accounts no longer appear in Limits, even when an earlier version kept them.
 @MainActor
-@Test func aLongPaneScrollsAndAShortOneKeepsItsHeight() {
-    #expect(settingsHeight(.limits, warming: 20) == SettingsView.tallestPane)
-    for tab in SettingsView.Tab.allCases where tab != .limits {
+@Test func limitsNoLongerGrowsWithWarmUpAccounts() {
+    #expect(settingsHeight(.limits, warming: 20) == settingsHeight(.limits))
+    for tab in SettingsView.Tab.allCases {
         #expect(settingsHeight(tab, warming: 20) < SettingsView.tallestPane, "\(tab)")
     }
 }

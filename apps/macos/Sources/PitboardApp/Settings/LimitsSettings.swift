@@ -11,7 +11,6 @@ struct LimitsSettings: View {
 
     var body: some View {
         let atLimit = model.machine.atLimit
-        let warm = model.machine.warm
         let share = Binding(
             get: { Int(atLimit.at) },
             set: {
@@ -60,51 +59,6 @@ struct LimitsSettings: View {
                 if let note = atLimit.note { Text(note).footnote() }
             }
             .disabled(!atLimit.enabled)
-
-            Section {
-                DatePicker(
-                    words.settings.from,
-                    selection: timeOfDay(warm.from) {
-                        model.send(.setWarmRange(from: $0, to: warm.to))
-                    },
-                    displayedComponents: .hourAndMinute
-                )
-                .accessibilityIdentifier("settings.warmFrom")
-                DatePicker(
-                    words.settings.to,
-                    selection: timeOfDay(warm.to) {
-                        model.send(.setWarmRange(from: warm.from, to: $0))
-                    },
-                    displayedComponents: .hourAndMinute
-                )
-                .accessibilityIdentifier("settings.warmTo")
-                if let none = warm.noneEnrolled {
-                    Text(none).explanatory()
-                }
-                ForEach(warm.accounts, id: \.qualified) { account in
-                    Toggle(
-                        isOn: Binding(
-                            get: { account.on },
-                            set: { model.send(.setWarm(account: account.account, on: $0)) })
-                    ) {
-                        Text(account.title)
-                        if let standing = account.standing {
-                            Text(standing)
-                        }
-                    }
-                    .accessibilityIdentifier("settings.warm.\(account.qualified)")
-                }
-                if let standing = warm.standing {
-                    Text(standing)
-                        .explanatory()
-                        .accessibilityIdentifier("settings.warmStanding")
-                }
-            } header: {
-                Text(warm.title)
-            } footer: {
-                Text(warm.note).footnote()
-            }
-            .disabled(!warm.enabled)
         }
         .formStyle(.grouped)
     }
@@ -138,22 +92,4 @@ private struct ShareField: View {
         typed = Int(share)
         if share != atLimit.at { send(share) }
     }
-}
-
-@MainActor
-private func timeOfDay(
-    _ minutes: UInt16, set: @escaping @MainActor @Sendable (UInt16) -> Void
-) -> Binding<Date> {
-    Binding(
-        get: {
-            // 24:00, the end of a day, shows as midnight.
-            let minutes = Int(minutes) % (24 * 60)
-            return Calendar.current.date(
-                bySettingHour: minutes / 60, minute: minutes % 60, second: 0, of: .now) ?? .now
-        },
-        set: { date in
-            let parts = Calendar.current.dateComponents([.hour, .minute], from: date)
-            let picked = (parts.hour ?? 0) * 60 + (parts.minute ?? 0)
-            set(UInt16(picked))
-        })
 }

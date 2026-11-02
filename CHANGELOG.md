@@ -7,6 +7,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- On macOS, Limits no longer shows the warm-up schedule or account switches.
+
 ## [1.0.0-beta.8] - 2026-10-31
 
 _On macOS, an update may take away a widget or control you placed, which then needs adding
