@@ -1051,10 +1051,7 @@ mod tests {
     /// change, made one at a time with every other.
     #[test]
     fn a_look_whether_to_switch_by_itself_runs_with_the_reads() {
-        for provider in [
-            ProviderId::Claude,
-            ProviderId::Codex,
-        ] {
+        for provider in [ProviderId::Claude, ProviderId::Codex] {
             assert_eq!(Job::AutoLook { provider, at: 95 }.lane(), Lane::Reads);
             assert_eq!(Job::AutoSwitch { provider, at: 95 }.lane(), Lane::Changes);
         }

@@ -354,11 +354,6 @@ const CODEX_FRESH_SECONDS: i64 = 300;
 /// of remembered readings and absent limits stays unchanged. OpenAI may return either
 /// window as null, which proves neither spare capacity nor the absence of that limit
 /// (`provider::codex::api::snapshot`, register `codex_usage_endpoint`).
-///
-/// Integration boundary: these are snapshot-level timestamps. `usage::answered` can retain
-/// omitted windows, without retaining their individual observation times. That producer
-/// needs raw-window completeness/freshness provenance before Codex automatic switching is
-/// enabled; a new timestamp on a merged snapshot alone cannot prove each window is fresh.
 fn answered(row: &Row, now: i64) -> Option<&Snapshot> {
     let reading = row.usage.as_ref().filter(|reading| reading.answered())?;
     if row.provider != ProviderId::Codex {
@@ -390,8 +385,9 @@ fn answered(row: &Row, now: i64) -> Option<&Snapshot> {
     .then_some(reading)
 }
 
-/// What Pitboard would do about `current`, the selected account in use, from `rows`, as
-/// `state` and `ledger` stand at `now`.
+/// What Pitboard would do about `current`, the selected account in use, from trusted
+/// `rows`, as `state` and `ledger` stand at `now`. The I/O boundary in `judge` checks Codex
+/// cache provenance before calling this pure decision function.
 ///
 /// Every limit at the share is judged, the furthest past it first. One already switched away
 /// from, or tried for as often as it is tried, leaves the next to be judged on its own: where
@@ -856,7 +852,20 @@ pub(crate) fn judge(
     threshold: Threshold,
     now: i64,
 ) -> Judged {
-    let rows = crate::status::gather_offline(ctx, state).rows;
+    let mut rows = crate::status::gather_offline(ctx, state).rows;
+    if account.provider() == ProviderId::Codex {
+        let raw = usage::readings::codex_raw(ctx);
+        for row in rows
+            .iter_mut()
+            .filter(|row| row.provider == ProviderId::Codex)
+        {
+            // Bind the marker to the exact snapshot read. A legacy cache, an old writer,
+            // or a concurrent replacement cannot make merged windows actionable.
+            if raw.get(&row.id) != row.usage.as_ref() {
+                row.usage = None;
+            }
+        }
+    }
     let key = account.key();
     let typed = state.typed(&key);
     let plan = match decide(state, &key, &rows, ledger, threshold, now) {

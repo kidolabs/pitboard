@@ -335,10 +335,30 @@ mod tests {
             .collect()
     }
 
+    fn codex_answer(m: &Machine, session: f64, weekly: f64) -> Snapshot {
+        let mut answer = answer(m, session, weekly);
+        answer.lists_every_limit = false;
+        answer.windows[0].kind = "five_hour".into();
+        answer.windows[1].kind = "seven_day".into();
+        answer
+    }
+
+    fn codex_measured(m: &Machine, label: &str, session: f64, weekly: f64) {
+        crate::usage::readings::answered_for(
+            &m.ctx,
+            Permit::for_a_test(),
+            &[(
+                ProviderId::Codex,
+                harness::codex_id(label),
+                codex_answer(m, session, weekly),
+            )],
+        );
+    }
+
     fn codex_nearly_out(name: &str) -> Machine {
         let m = harness::codex_machine(name);
-        measured(&m, &harness::codex_id("here"), 96.0, 20.0);
-        measured(&m, &harness::codex_id("there"), 10.0, 30.0);
+        codex_measured(&m, "here", 96.0, 20.0);
+        codex_measured(&m, "there", 10.0, 30.0);
         m
     }
 
@@ -425,7 +445,7 @@ mod tests {
                 .unwrap(),
             Look::Act
         ));
-        measured(&m, &harness::codex_id("there"), 100.0, 100.0);
+        codex_measured(&m, "there", 100.0, 100.0);
         let before = m.live();
         let settled = settle(&m.ctx, Permit::for_a_test(), Some(ProviderId::Codex))
             .unwrap()
@@ -454,14 +474,15 @@ mod tests {
             ("unknown", Vec::new()),
         ] {
             let m = codex_nearly_out(&format!("auto-codex-no-room-{name}"));
-            crate::usage::readings::answered(
+            crate::usage::readings::answered_for(
                 &m.ctx,
                 Permit::for_a_test(),
                 &[(
+                    ProviderId::Codex,
                     harness::codex_id("there"),
                     Snapshot {
                         windows,
-                        ..answer(&m, 0.0, 0.0)
+                        ..codex_answer(&m, 0.0, 0.0)
                     },
                 )],
             );
@@ -480,6 +501,95 @@ mod tests {
             assert_eq!(stays(&m).len(), 1);
             assert_eq!(m.api.calls(), 0, "no auth or quota probes to find room");
         }
+    }
+
+    #[test]
+    fn codex_legacy_merged_cache_is_never_actionable_even_for_a_new_reader() {
+        for label in ["here", "there"] {
+            let m = codex_nearly_out(&format!("auto-codex-legacy-{label}"));
+            let file = home::dir(&m.ctx).join("usage.json");
+            let mut disk: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            let id = harness::codex_id(label);
+            let fresh: Snapshot = serde_json::from_value(disk[&id].clone()).unwrap();
+            let old = Snapshot {
+                observed_at: Some(NOW - 600),
+                answered_at: Some(NOW - 600),
+                ..fresh.clone()
+            };
+            let partial = Snapshot {
+                windows: vec![fresh.windows[0].clone()],
+                ..fresh
+            };
+            // Claude's retained-window merge is the old Codex policy. Reproduce that
+            // legacy writer: an old omitted weekly window gets a fresh aggregate stamp,
+            // but no provenance marker. A new reader must not trust the two-window shape.
+            let merged = crate::usage::answered(Some(&old), &partial, NOW);
+            assert_eq!(merged.windows.len(), 2);
+            assert_eq!(merged.answered_at, Some(NOW));
+            disk[&id] = serde_json::to_value(merged).unwrap();
+            std::fs::write(&file, serde_json::to_vec(&disk).unwrap()).unwrap();
+            let before = (m.live(), state_file(&m), m.mem.vault().services());
+            for _ in 0..3 {
+                let result = codex_auto(&m).unwrap().value;
+                match label {
+                    "here" => assert!(matches!(
+                        result,
+                        Auto::NotWatching {
+                            why: Blind::NoReading { .. }
+                        }
+                    )),
+                    _ => assert!(
+                        matches!(result, Auto::Skipped { why: Skip::NoRoom { ref unread }, .. } if unread == &["codex/there"])
+                    ),
+                }
+            }
+            assert_eq!((m.live(), state_file(&m), m.mem.vault().services()), before);
+            assert!(logged(&m).is_empty(), "no switch attempt");
+            assert_eq!(m.api.calls(), 0, "no live/auth fallback to bless the cache");
+        }
+    }
+
+    #[test]
+    fn codex_disjoint_partial_answers_never_combine_into_fresh_room() {
+        let m = codex_nearly_out("auto-codex-disjoint-partials");
+        let before = (m.live(), state_file(&m), m.mem.vault().services());
+        for index in [0, 1] {
+            let raw = codex_answer(&m, 0.0, 0.0);
+            crate::usage::readings::answered_for(
+                &m.ctx,
+                Permit::for_a_test(),
+                &[(
+                    ProviderId::Codex,
+                    harness::codex_id("there"),
+                    Snapshot {
+                        windows: vec![raw.windows[index].clone()],
+                        ..raw
+                    },
+                )],
+            );
+            let saved = crate::usage::readings::load(&m.ctx);
+            assert_eq!(saved[&harness::codex_id("there")].windows.len(), 1);
+            assert!(matches!(
+                codex_auto(&m).unwrap().value,
+                Auto::Skipped {
+                    why: Skip::NoRoom { .. },
+                    ..
+                }
+            ));
+            assert_eq!((m.live(), state_file(&m), m.mem.vault().services()), before);
+            assert!(logged(&m).is_empty());
+        }
+        assert_eq!(m.api.calls(), 0);
+        // A real complete raw answer, not restarting a reader, makes room actionable.
+        codex_measured(&m, "there", 0.0, 0.0);
+        assert!(matches!(
+            codex_auto(&m).unwrap().value,
+            Auto::Switched { .. }
+        ));
+        hold(
+            &m,
+            "after complete raw Codex quota replaced disjoint partial answers",
+        );
     }
 
     #[test]
